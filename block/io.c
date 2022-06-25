@@ -3209,19 +3209,11 @@ int bdrv_co_zone_report(BlockDriverState *bs, int64_t offset,
     IO_CODE();
 
     bdrv_inc_in_flight(bs);
-    if (!drv || (!drv->bdrv_co_zone_report)) {
+    if (!drv || !drv->bdrv_co_zone_report) {
         co.ret = -ENOTSUP;
         goto out;
     }
-
-    if (drv->bdrv_co_zone_report) {
-        co.ret = drv->bdrv_co_zone_report(bs, offset, nr_zones, zones);
-    } else {
-        co.ret = -ENOTSUP;
-        goto out;
-        qemu_coroutine_yield();
-    }
-
+    co.ret = drv->bdrv_co_zone_report(bs, offset, nr_zones, zones);
 out:
     bdrv_dec_in_flight(bs);
     return co.ret;
@@ -3237,19 +3229,11 @@ int bdrv_co_zone_mgmt(BlockDriverState *bs, BlockZoneOp op,
     IO_CODE();
 
     bdrv_inc_in_flight(bs);
-    if (!drv || (!drv->bdrv_co_zone_mgmt)) {
+    if (!drv || !drv->bdrv_co_zone_mgmt) {
         co.ret = -ENOTSUP;
         goto out;
     }
-
-    if (drv->bdrv_co_zone_mgmt) {
-        co.ret = drv->bdrv_co_zone_mgmt(bs, op, offset, len);
-    } else {
-        co.ret = -ENOTSUP;
-        goto out;
-        qemu_coroutine_yield();
-    }
-
+    co.ret = drv->bdrv_co_zone_mgmt(bs, op, offset, len);
 out:
     bdrv_dec_in_flight(bs);
     return co.ret;
