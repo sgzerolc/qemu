@@ -995,6 +995,7 @@ static uint64_t virtio_blk_get_features(VirtIODevice *vdev, uint64_t features,
                                         Error **errp)
 {
     VirtIOBlock *s = VIRTIO_BLK(vdev);
+    BlockDriverState *state = blk_bs(s->blk);
 
     /* Firstly sync all virtio-blk possible supported features */
     features |= s->host_features;
@@ -1286,6 +1287,7 @@ static Property virtio_blk_properties[] = {
 #ifdef __linux__
     DEFINE_PROP_BIT64("scsi", VirtIOBlock, host_features,
                       VIRTIO_BLK_F_SCSI, false),
+    DEFINE_PROP_BIT64("zoned", VirtIOBlock, host_features, VIRTIO_BLK_F_ZONED, true),
 #endif
     DEFINE_PROP_BIT("request-merging", VirtIOBlock, conf.request_merging, 0,
                     true),
