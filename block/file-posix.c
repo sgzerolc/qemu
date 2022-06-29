@@ -777,6 +777,19 @@ static int raw_open_common(BlockDriverState *bs, QDict *options,
             goto fail;
         }
     }
+#ifdef CONFIG_BLKZONED
+    /*
+     * The kernel page chache does not reliably work for writes to SWR zones
+     * of zoned block device because it can not guarantee the order of writes.
+     */
+
+    if (!(s->open_flags & O_DIRECT)) {
+        error_setg(errp, "driver=zoned_host_device was specified, but it "
+                         "requires cache.direct=on, which was not specified.");
+        ret = -EINVAL;
+        return ret; /* No host kernel page cache */
+    }
+#endif
 
     if (S_ISBLK(st.st_mode)) {
 #ifdef BLKDISCARDZEROES
