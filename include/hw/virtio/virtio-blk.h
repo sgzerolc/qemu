@@ -80,6 +80,7 @@ typedef struct VirtIOBlockReq {
     struct VirtIOBlockReq *next;
     struct VirtIOBlockReq *mr_next;
     BlockAcctCookie acct;
+    int64_t flags;
 } VirtIOBlockReq;
 
 #define VIRTIO_BLK_MAX_MERGE_REQS 32
