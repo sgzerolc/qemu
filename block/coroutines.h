@@ -85,6 +85,7 @@ int coroutine_fn blk_co_zone_report(BlockBackend *blk, int64_t offset,
                                     BlockZoneDescriptor *zones);
 int coroutine_fn blk_co_zone_mgmt(BlockBackend *blk, BlockZoneOp op,
                                   int64_t offset, int64_t len);
+int coroutine_fn blk_co_zone_append(BlockBackend *blk, int64_t offset);
 
 
 /*

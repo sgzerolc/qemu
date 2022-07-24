@@ -226,6 +226,9 @@ typedef struct RawPosixAIOData {
         struct {
             BlockZoneOp op;
         } zone_mgmt;
+        struct {
+            int64_t offset; /* place holder */
+        } zone_append;
     };
 } RawPosixAIOData;
 
@@ -2044,6 +2047,10 @@ static int handle_aiocb_zone_mgmt(void *opaque) {
 
     return 0;
 }
+
+static int handle_aiocb_zone_append(void *opaque) {
+    return 0;
+}
 #endif
 
 static int handle_aiocb_copy_range(void *opaque)
@@ -3271,6 +3278,23 @@ static int coroutine_fn raw_co_zone_mgmt(BlockDriverState *bs, BlockZoneOp op,
 
     return raw_thread_pool_submit(bs, handle_aiocb_zone_mgmt, &acb);
 }
+
+static int coroutine_fn raw_co_zone_append(BlockDriverState *bs, int64_t offset) {
+    BDRVRawState *s = bs->opaque;
+    RawPosixAIOData acb;
+
+    acb = (RawPosixAIOData) {
+        .bs         = bs,
+        .aio_fildes = s->fd,
+//        .aio_type   = QEMU_AIO_,
+        .aio_offset = offset,
+        .zone_append    = {
+                .offset = offset,
+        },
+    };
+
+    return raw_thread_pool_submit(bs, handle_aiocb_zone_append, &acb);
+}
 #endif
 
 static coroutine_fn int
@@ -4060,6 +4084,7 @@ static BlockDriver bdrv_zoned_host_device = {
         /* zone management operations */
         .bdrv_co_zone_report = raw_co_zone_report,
         .bdrv_co_zone_mgmt = raw_co_zone_mgmt,
+        .bdrv_co_zone_append = raw_co_zone_append,
 };
 #endif
 

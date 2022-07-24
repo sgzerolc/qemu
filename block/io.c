@@ -3300,6 +3300,34 @@ out:
     return co.ret;
 }
 
+int bdrv_co_zone_append(BlockDriverState *bs, int64_t offset)
+{
+    BlockDriver *drv = bs->drv;
+    CoroutineIOCompletion co = {
+            .coroutine = qemu_coroutine_self(),
+    };
+    IO_CODE();
+
+    bdrv_inc_in_flight(bs);
+    if (!drv || (!drv->bdrv_co_zone_mgmt)) {
+        co.ret = -ENOTSUP;
+        goto out;
+    }
+
+    if (drv->bdrv_co_zone_append) {
+        co.ret = drv->bdrv_co_zone_append(bs, offset);
+    } else {
+        co.ret = -ENOTSUP;
+        goto out;
+        qemu_coroutine_yield();
+    }
+
+    out:
+    bdrv_dec_in_flight(bs);
+    return co.ret;
+}
+
+
 void *qemu_blockalign(BlockDriverState *bs, size_t size)
 {
     IO_CODE();

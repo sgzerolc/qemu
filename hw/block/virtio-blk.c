@@ -620,6 +620,11 @@ static int virtio_blk_handle_zone_mgmt(int64_t offset, ZoneMgmtData *data) {
     return 0;
 }
 
+//static void virtio_blk_zone_append_complete(void *opaque, int ret) {
+//    return;
+//}
+
+static int virtio_blk_handle_zone_append(int64_t offset, VirtIOBlockReq *req){
     return 0;
 }
 
@@ -859,6 +864,10 @@ static int virtio_blk_handle_request(VirtIOBlockReq *req, MultiReqBuffer *mrb)
         ZMD.req = req;
         ZMD.op = BLK_ZO_FINISH;
         virtio_blk_handle_zone_mgmt(offset, &ZMD);
+        break;
+    case VIRTIO_BLK_T_ZONE_APPEND:
+        offset = virtio_ldq_p(vdev, &req->out.sector);
+        virtio_blk_handle_zone_append(offset, req);
         break;
     case VIRTIO_BLK_T_SCSI_CMD:
         virtio_blk_handle_scsi(req);
