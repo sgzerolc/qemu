@@ -1287,7 +1287,9 @@ out:
 /*
  * Convert the zoned attribute file in sysfs to internal value.
  */
-static BlockZoneModel get_sysfs_str_val(int fd, struct stat *st) {
+static int get_sysfs_str_val(int fd, struct stat *st,
+                              const char *attribute,
+                              char **val) {
 #ifdef CONFIG_LINUX
     char buf[32];
     char *sysfspath = NULL;
@@ -1305,8 +1307,9 @@ static BlockZoneModel get_sysfs_str_val(int fd, struct stat *st) {
         return -ENOTSUP;
     }
 
-    sysfspath = g_strdup_printf("/sys/dev/block/%u:%u/queue/zoned",
-                                major(st->st_rdev), minor(st->st_rdev));
+    sysfspath = g_strdup_printf("/sys/dev/block/%u:%u/queue/%s",
+                                major(st->st_rdev), minor(st->st_rdev),
+                                attribute);
     sysfd = open(sysfspath, O_RDONLY);
     if (sysfd == -1) {
         ret = -errno;
@@ -1324,14 +1327,8 @@ static BlockZoneModel get_sysfs_str_val(int fd, struct stat *st) {
         buf[ret - 1] = '\0';
     }
 
-    if (strcmp(buf, "host-managed") == 0) {
-        return BLK_Z_HM;
-    } else if (strcmp(buf, "host-aware") == 0) {
-        return BLK_Z_HA;
-    } else if (strcmp(buf, "none") == 0) {
-        return BLK_Z_NONE;
-    } else {
-        return -ENOTSUP;
+    if (!strncpy(*val, buf, ret)) {
+        goto out;
     }
 
 out:
@@ -1343,6 +1340,27 @@ out:
 #else
     return -ENOTSUP;
 #endif
+}
+
+static int get_sysfs_zoned_model(int fd, struct stat *st,
+                                 BlockZoneModel *zoned) {
+    g_autofree char *val = NULL;
+    val = g_malloc(32);
+    get_sysfs_str_val(fd, st, "zoned", &val);
+    if (!val) {
+        return -ENOTSUP;
+    }
+
+    if (strcmp(val, "host-managed") == 0) {
+        *zoned = BLK_Z_HM;
+    } else if (strcmp(val, "host-aware") == 0) {
+        *zoned = BLK_Z_HA;
+    } else if (strcmp(val, "none") == 0) {
+        *zoned = BLK_Z_NONE;
+    } else {
+        return -ENOTSUP;
+    }
+    return 0;
 }
 
 static int hdev_get_max_segments(int fd, struct stat *st) {
@@ -1393,9 +1411,14 @@ static void raw_refresh_limits(BlockDriverState *bs, Error **errp)
         }
     }
 
-    zoned = get_sysfs_str_val(s->fd, &st);
+    ret = get_sysfs_zoned_model(s->fd, &st, &zoned);
+    if (ret < 0) {
+        printf("no zoned model\n");
+        return;
+    }
+
+    printf("file-posix:zoned = %d\n", zoned);
     if (zoned > 0) {
-        printf("zoned?\n");
         bs->bl.zoned = zoned;
 
         ret = get_sysfs_long_val(s->fd, &st, "chunk_sectors");
@@ -1944,7 +1967,7 @@ static int handle_aiocb_zone_report(void *opaque) {
     rep_size = sizeof(struct blk_zone_report) + nrz * sizeof(struct blk_zone);
     g_autofree struct blk_zone_report *rep = NULL;
     rep = g_malloc(rep_size);
-    printf("<temporary> Start to report zone with offset: 0x%lx\n", sector);
+    printf("temp:Start to report zone with offset: 0x%lx\n", sector);
 
     blkz = (struct blk_zone *)(rep + 1);
     while (n < nrz) {
@@ -1980,9 +2003,9 @@ static int handle_aiocb_zone_report(void *opaque) {
 static int handle_aiocb_zone_mgmt(void *opaque) {
     RawPosixAIOData *aiocb = opaque;
     int fd = aiocb->aio_fildes;
+    int64_t offset = aiocb->aio_offset;
     /* BLK*ZONE ioctls use 512B sectors */
-    int64_t sector = aiocb->aio_offset / 512;
-    int64_t nr_sectors = aiocb->aio_nbytes / 512;
+    int64_t nr_sector = aiocb->aio_nbytes;
     BlockZoneOp op = aiocb->zone_mgmt.op;
 
     struct blk_zone_range range;
@@ -2000,12 +2023,12 @@ static int handle_aiocb_zone_mgmt(void *opaque) {
     zone_sector = get_sysfs_long_val(fd, &file,
                                      "chunk_sectors");
     zone_sector_mask = zone_sector - 1;
-    if (sector & zone_sector_mask) {
+    if (offset & zone_sector_mask) {
         error_report("offset is not the start of a zone");
         return -EINVAL;
     }
 
-    if (nr_sectors & zone_sector_mask) {
+    if (nr_sector & zone_sector_mask) {
         error_report("len is not aligned to zones");
         return -EINVAL;
     }
@@ -2033,8 +2056,8 @@ static int handle_aiocb_zone_mgmt(void *opaque) {
     }
 
     /* Execute the operation */
-    range.sector = zone_sector;
-    range.nr_sectors = nr_sectors;
+    range.sector = offset;
+    range.nr_sectors = nr_sector;
     do {
         ret = ioctl(fd, ioctl_op, &range);
     } while (ret != 0 && errno == EINTR);
