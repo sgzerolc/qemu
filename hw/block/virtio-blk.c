@@ -37,6 +37,7 @@
 /* Config size before the discard support (hide associated config fields) */
 #define VIRTIO_BLK_CFG_SIZE offsetof(struct virtio_blk_config, \
                                      max_discard_sectors)
+
 /*
  * Starting from the discard feature, we can use this array to properly
  * set the config size depending on the features enabled.
@@ -46,6 +47,8 @@ static const VirtIOFeature feature_sizes[] = {
      .end = endof(struct virtio_blk_config, discard_sector_alignment)},
     {.flags = 1ULL << VIRTIO_BLK_F_WRITE_ZEROES,
      .end = endof(struct virtio_blk_config, write_zeroes_may_unmap)},
+    {.flags = 1ULL << VIRTIO_BLK_F_ZONED,
+     .end = endof(struct virtio_blk_config, zoned)},
     {}
 };
 
@@ -514,6 +517,131 @@ static void virtio_blk_handle_flush(VirtIOBlockReq *req, MultiReqBuffer *mrb)
     blk_aio_flush(s->blk, virtio_blk_flush_complete, req);
 }
 
+typedef struct ZoneReportData {
+    VirtIOBlockReq *req;
+    unsigned int nr_zones;
+    BlockZoneDescriptor zones[];
+} ZoneReportData;
+
+static void virtio_blk_zone_report_complete(void *opaque, int ret)
+{
+    ZoneReportData *data = opaque;
+    VirtIOBlockReq *req = data->req;
+    VirtIOBlock *s = req->dev;
+    VirtIODevice *vdev = VIRTIO_DEVICE(req->dev);
+    struct iovec *in_iov = req->elem.in_sg;
+    unsigned in_num = req->elem.in_num;
+    int64_t zrp_size, nz, offset, n, j; /* offset is of in_iov */
+
+    nz = data->nr_zones;
+    j = 0;
+
+    struct virtio_blk_zone_report zrp_hdr = (struct virtio_blk_zone_report) {
+            .nr_zones = cpu_to_le64(nz),
+    };
+
+    zrp_size = sizeof(struct virtio_blk_zone_report)
+              + sizeof(struct virtio_blk_zone_descriptor) * nz;
+    offset = sizeof(zrp_hdr);
+
+    memset(zrp_hdr.reserved, 0, 56);
+    aio_context_acquire(blk_get_aio_context(s->conf.conf.blk));
+    n = iov_from_buf(in_iov, in_num, 0, &zrp_hdr, offset);
+    if (n != sizeof(zrp_hdr)) {
+        virtio_error(vdev, "Driver provided intput buffer that is too small!");
+        return;
+    }
+
+    for (size_t i = offset; i < zrp_size; i += sizeof(struct virtio_blk_zone_descriptor), ++j) {
+        struct virtio_blk_zone_descriptor desc =
+                (struct virtio_blk_zone_descriptor) {
+                        .z_start = cpu_to_le64(data->zones[j].start),
+                        .z_cap = cpu_to_le64(data->zones[j].cap),
+                        .z_wp = cpu_to_le64(data->zones[j].wp),
+                        .z_type = data->zones[j].type,
+                        .z_state = data->zones[j].cond,
+                };
+        memset(desc.reserved, 0, 38);
+        n = iov_from_buf(in_iov, in_num, i, &desc, sizeof(desc));
+        if (n != sizeof(desc)) {
+            virtio_error(vdev, "Driver provided input buffer "
+                               "for descriptors that is too small!");
+            return;
+        }
+    }
+    g_free(data);
+
+    virtio_blk_req_complete(req, VIRTIO_BLK_S_OK);
+    virtio_blk_free_request(req);
+    aio_context_release(blk_get_aio_context(s->conf.conf.blk));
+}
+
+static int virtio_blk_handle_zone_report(VirtIOBlockReq *req) {
+    VirtIOBlock *s = req->dev;
+    VirtIODevice *vdev = VIRTIO_DEVICE(s);
+    unsigned int nr_zones;
+    size_t data_size;
+    ZoneReportData *data;
+    int64_t offset;
+
+    if (req->in_len <= sizeof(struct virtio_blk_inhdr)) {
+        virtio_error(vdev, "in buffer too small for zone report");
+        return -1;
+    }
+
+    /* start offset of the zone report */
+    offset = virtio_ldq_p(vdev, &req->out.sector);
+    nr_zones = (req->in_len - sizeof(struct virtio_blk_inhdr) -
+                sizeof(struct virtio_blk_zone_report)) /
+                sizeof(struct virtio_blk_zone_descriptor);
+    data_size = sizeof(ZoneReportData) +
+                sizeof(BlockZoneDescriptor) * nr_zones;
+    data = g_malloc(data_size);
+    memset(data, 0, data_size);
+    data->nr_zones = nr_zones;
+    data->req = req;
+
+    blk_aio_zone_report(s->blk, offset, &data->nr_zones, data->zones,
+                        virtio_blk_zone_report_complete, data);
+    return 0;
+}
+
+static void virtio_blk_zone_mgmt_complete(void *opaque, int ret) {
+    VirtIOBlockReq *req = opaque;
+
+    virtio_blk_req_complete(req, VIRTIO_BLK_S_OK);
+    virtio_blk_free_request(req);
+}
+
+static int virtio_blk_handle_zone_mgmt(VirtIOBlockReq *req, BlockZoneOp op) {
+    VirtIOBlock *s = req->dev;
+    VirtIODevice *vdev = VIRTIO_DEVICE(s);
+    int64_t offset = virtio_ldq_p(vdev, &req->out.sector);
+    struct iovec *out_iov =req->elem.out_sg;
+    unsigned out_num = req->elem.out_num;
+    BlockDriverState *state = blk_bs(s->blk);
+    struct virtio_blk_zone_mgmt_outhdr zm_hdr;
+    uint64_t len;
+
+    if (unlikely(iov_to_buf(out_iov, out_num, 0, &zm_hdr,
+                            sizeof(zm_hdr)) != sizeof(zm_hdr))){
+        virtio_error(vdev, "virtio-blk request zone_mgmt_outhdr too short");
+        return -1;
+    }
+
+    if (zm_hdr.flags & VIRTIO_BLK_ZONED_FLAG_ALL) {
+        /* Entire drive capacity */
+        offset = 0;
+        blk_get_geometry(s->blk, &len);
+    } else {
+        len = state->bl.zone_sectors;
+    }
+
+    blk_aio_zone_mgmt(s->blk, op, offset, len,
+                      virtio_blk_zone_mgmt_complete, req);
+    return 0;
+}
+
 static bool virtio_blk_sect_range_ok(VirtIOBlock *dev,
                                      uint64_t sector, size_t size)
 {
@@ -699,6 +827,21 @@ static int virtio_blk_handle_request(VirtIOBlockReq *req, MultiReqBuffer *mrb)
     }
     case VIRTIO_BLK_T_FLUSH:
         virtio_blk_handle_flush(req, mrb);
+        break;
+    case VIRTIO_BLK_T_ZONE_REPORT:
+        virtio_blk_handle_zone_report(req);
+        break;
+    case VIRTIO_BLK_T_ZONE_OPEN:
+        virtio_blk_handle_zone_mgmt(req, BLK_ZO_OPEN);
+        break;
+    case VIRTIO_BLK_T_ZONE_CLOSE:
+        virtio_blk_handle_zone_mgmt(req, BLK_ZO_CLOSE);
+        break;
+    case VIRTIO_BLK_T_ZONE_RESET:
+        virtio_blk_handle_zone_mgmt(req, BLK_ZO_RESET);
+        break;
+    case VIRTIO_BLK_T_ZONE_FINISH:
+        virtio_blk_handle_zone_mgmt(req, BLK_ZO_FINISH);
         break;
     case VIRTIO_BLK_T_SCSI_CMD:
         virtio_blk_handle_scsi(req);
@@ -913,10 +1056,10 @@ static void virtio_blk_reset(VirtIODevice *vdev)
 
 /* coalesce internal state, copy to pci i/o region 0
  */
-static void virtio_blk_update_config(VirtIODevice *vdev, uint8_t *config)
-{
+static void virtio_blk_update_config(VirtIODevice *vdev, uint8_t *config) {
     VirtIOBlock *s = VIRTIO_BLK(vdev);
     BlockConf *conf = &s->conf.conf;
+    BlockDriverState *state = blk_bs(s->blk);
     struct virtio_blk_config blkcfg;
     uint64_t capacity;
     int64_t length;
@@ -976,6 +1119,25 @@ static void virtio_blk_update_config(VirtIODevice *vdev, uint8_t *config)
         blkcfg.write_zeroes_may_unmap = 1;
         virtio_stl_p(vdev, &blkcfg.max_write_zeroes_seg, 1);
     }
+#ifdef CONFIG_BLKZONED
+    blkcfg.zoned.model = state->bl.zoned;
+    if (state->bl.zoned != BLK_Z_NONE) {
+        switch (state->bl.zoned) {
+        case BLK_Z_HM:
+        case BLK_Z_HA:
+            virtio_stl_p(vdev, &blkcfg.zoned.zone_sectors, state->bl.zone_sectors);
+            virtio_stl_p(vdev, &blkcfg.zoned.max_active_zones, state->bl.max_active_zones);
+            virtio_stl_p(vdev, &blkcfg.zoned.max_open_zones, state->bl.max_open_zones);
+            virtio_stl_p(vdev, &blkcfg.zoned.max_append_sectors, state->bl.zone_append_max_bytes);
+            virtio_stl_p(vdev, &blkcfg.zoned.write_granularity, blk_size);
+            break;
+        default:
+            virtio_error(vdev, "Invalid zoned model %x \n", (int)state->bl.zoned);
+            blkcfg.zoned.model = BLK_Z_NONE;
+            break;
+        }
+    }
+#endif
     memcpy(config, &blkcfg, s->config_size);
 }
 
@@ -995,6 +1157,7 @@ static uint64_t virtio_blk_get_features(VirtIODevice *vdev, uint64_t features,
                                         Error **errp)
 {
     VirtIOBlock *s = VIRTIO_BLK(vdev);
+    BlockDriverState *state = blk_bs(s->blk);
 
     /* Firstly sync all virtio-blk possible supported features */
     features |= s->host_features;
@@ -1003,6 +1166,8 @@ static uint64_t virtio_blk_get_features(VirtIODevice *vdev, uint64_t features,
     virtio_add_feature(&features, VIRTIO_BLK_F_GEOMETRY);
     virtio_add_feature(&features, VIRTIO_BLK_F_TOPOLOGY);
     virtio_add_feature(&features, VIRTIO_BLK_F_BLK_SIZE);
+    if (state->bl.zoned != BLK_Z_NONE)
+        virtio_add_feature(&s->host_features, VIRTIO_BLK_F_ZONED);
     if (virtio_has_feature(features, VIRTIO_F_VERSION_1)) {
         if (virtio_has_feature(s->host_features, VIRTIO_BLK_F_SCSI)) {
             error_setg(errp, "Please set scsi=off for virtio-blk devices in order to use virtio 1.0");
@@ -1286,6 +1451,9 @@ static Property virtio_blk_properties[] = {
 #ifdef __linux__
     DEFINE_PROP_BIT64("scsi", VirtIOBlock, host_features,
                       VIRTIO_BLK_F_SCSI, false),
+#endif
+#ifdef CONFIG_BLKZONED
+    DEFINE_PROP_BIT64("zoned", VirtIOBlock, host_features, VIRTIO_BLK_F_ZONED, true),
 #endif
     DEFINE_PROP_BIT("request-merging", VirtIOBlock, conf.request_merging, 0,
                     true),
