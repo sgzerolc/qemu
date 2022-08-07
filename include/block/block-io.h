@@ -94,6 +94,9 @@ int coroutine_fn bdrv_co_zone_report(BlockDriverState *bs, int64_t offset,
                                      BlockZoneDescriptor *zones);
 int coroutine_fn bdrv_co_zone_mgmt(BlockDriverState *bs, BlockZoneOp op,
                                    int64_t offset, int64_t len);
+int coroutine_fn bdrv_co_zone_append(BlockDriverState *bs, int64_t *offset,
+                                     int64_t len, QEMUIOVector *qiov,
+                                     BdrvRequestFlags flags);
 
 int bdrv_co_pdiscard(BdrvChild *child, int64_t offset, int64_t bytes);
 bool bdrv_can_write_zeroes_with_unmap(BlockDriverState *bs);
@@ -303,12 +306,6 @@ int generated_co_wrapper
 bdrv_readv_vmstate(BlockDriverState *bs, QEMUIOVector *qiov, int64_t pos);
 int generated_co_wrapper
 bdrv_writev_vmstate(BlockDriverState *bs, QEMUIOVector *qiov, int64_t pos);
-
-int generated_co_wrapper
-blk_zone_report(BlockBackend *blk, int64_t offset, unsigned int *nr_zones,
-                BlockZoneDescriptor *zones);
-int generated_co_wrapper
-blk_zone_mgmt(BlockBackend *blk, BlockZoneOp op, int64_t offset, int64_t len);
 
 /**
  * bdrv_parent_drained_begin_single:

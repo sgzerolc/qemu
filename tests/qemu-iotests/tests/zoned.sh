@@ -25,7 +25,7 @@ _supported_proto file
 _supported_os Linux
 
 QEMU_IO="build/qemu-io"
-IMG="--image-opts driver=zoned_host_device,filename=/dev/nullb0"
+IMG="--image-opts -n driver=zoned_host_device,filename=/dev/nullb0"
 QEMU_IO_OPTIONS=$QEMU_IO_OPTIONS_NO_FMT
 
 echo "Testing a null_blk device:"

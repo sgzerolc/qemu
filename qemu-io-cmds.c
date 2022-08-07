@@ -1850,6 +1850,33 @@ static const cmdinfo_t zone_reset_cmd = {
         .oneline = "reset a zone write pointer in zone block device",
 };
 
+//static int zone_append_f(BlockBackend *blk, int argc, char **argv) {
+//    int ret;
+//    int64_t offset, len;
+//    QEMUIOVector qiov;
+//    int flags = 0;
+//
+//    ++optind;
+//    offset = cvtnum(argv[optind]);
+//    ++optind;
+//    len = cvtnum(argv[optind]);
+//    ret = blk_zone_append(blk, offset, len, &qiov, flags);
+//    if (ret < 0) {
+//        printf("zone append failed: %s\n", strerror(-ret));
+//    }
+//    return ret;
+//}
+//
+//static const cmdinfo_t zone_append_cmd = {
+//        .name = "zone_append",
+//        .altname = "zap",
+//        .cfunc = zone_append_f,
+//        .argmin = 2,
+//        .argmax = 2,
+//        .args = "offset len",
+//        .oneline = "append write",
+//};
+
 static int truncate_f(BlockBackend *blk, int argc, char **argv);
 static const cmdinfo_t truncate_cmd = {
     .name       = "truncate",
@@ -2647,6 +2674,7 @@ static void __attribute((constructor)) init_qemuio_commands(void)
     qemuio_add_command(&zone_close_cmd);
     qemuio_add_command(&zone_finish_cmd);
     qemuio_add_command(&zone_reset_cmd);
+//    qemuio_add_command(&zone_append_cmd);
     qemuio_add_command(&truncate_cmd);
     qemuio_add_command(&length_cmd);
     qemuio_add_command(&info_cmd);
