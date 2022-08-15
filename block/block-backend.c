@@ -1925,6 +1925,7 @@ int coroutine_fn blk_co_zone_report(BlockBackend *blk, int64_t offset,
 {
     int ret;
     IO_CODE();
+    trace_blk_co_zone_report(blk, offset, *nr_zones, zones);
 
     blk_inc_in_flight(blk); /* increase before waiting */
     blk_wait_while_drained(blk);
@@ -1947,6 +1948,7 @@ int coroutine_fn blk_co_zone_mgmt(BlockBackend *blk, BlockZoneOp op,
 {
     int ret;
     IO_CODE();
+    trace_blk_co_zone_mgmt(blk, op, offset, len);
 
     ret = blk_check_byte_request(blk, offset, len);
     if (ret < 0) {
@@ -1971,6 +1973,7 @@ int coroutine_fn blk_co_zone_append(BlockBackend *blk, int64_t *offset,
 {
     int ret;
     IO_CODE();
+    trace_blk_co_zone_append(blk, *offset, len);
 
     blk_inc_in_flight(blk);
     blk_wait_while_drained(blk);
