@@ -54,6 +54,7 @@ typedef enum BlockZoneOp {
     BLK_ZO_CLOSE,
     BLK_ZO_FINISH,
     BLK_ZO_RESET,
+    BLK_ZO_RESET_ALL,
 } BlockZoneOp;
 
 typedef enum BlockZoneModel {
@@ -84,6 +85,7 @@ typedef enum BlockZoneType {
  * Provides information on a zone with all position and size values in bytes.
  */
 typedef struct BlockZoneDescriptor {
+    QemuMutex lock;
     uint64_t start;
     uint64_t length;
     uint64_t cap;
