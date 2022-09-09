@@ -173,6 +173,7 @@ typedef struct BDRVRawState {
     } stats;
 
     PRManager *pr_mgr;
+    CoRwlock zones_lock;
 } BDRVRawState;
 
 typedef struct BDRVRawReopenState {
@@ -206,6 +207,8 @@ typedef struct RawPosixAIOData {
         struct {
             struct iovec *iov;
             int niov;
+            int64_t *append_sector;
+            BlockZoneDescriptor *zone;
         } io;
         struct {
             uint64_t cmd;
@@ -1333,6 +1336,9 @@ static int hdev_get_max_segments(int fd, struct stat *st) {
 #endif
 }
 
+static inline void parse_zone(struct BlockZoneDescriptor *zone,
+                              const struct blk_zone *blkz);
+static int do_zone_report(int64_t offset, int fd, struct BlockZoneDescriptor *zones, unsigned int nrz);
 static void raw_refresh_limits(BlockDriverState *bs, Error **errp)
 {
     BDRVRawState *s = bs->opaque;
@@ -1401,6 +1407,19 @@ static void raw_refresh_limits(BlockDriverState *bs, Error **errp)
         ret = get_sysfs_long_val(&st, "max_active_zones");
         if (ret >= 0) {
             bs->bl.max_active_zones = ret;
+        }
+
+        ret = get_sysfs_long_val(&st, "logical_block_size");
+        if (ret >= 0) {
+            bs->bl.logical_block_size = ret;
+        }
+
+        ret = get_sysfs_long_val(&st, "nr_zones");
+        if (ret > 0) {
+            bs->bl.nr_zones = ret;
+            int64_t zones_size = ret * sizeof(BlockZoneDescriptor);
+            bs->bl.zones = g_malloc(zones_size);
+            do_zone_report(0, s->fd, bs->bl.zones, ret);
         }
     }
 }
@@ -1569,18 +1588,24 @@ static ssize_t handle_aiocb_rw_vector(RawPosixAIOData *aiocb)
     ssize_t len;
 
     do {
-        if (aiocb->aio_type & QEMU_AIO_WRITE)
+        if (aiocb->aio_type & QEMU_AIO_WRITE) {
             len = qemu_pwritev(aiocb->aio_fildes,
                                aiocb->io.iov,
                                aiocb->io.niov,
                                aiocb->aio_offset);
-         else
+        } else if (aiocb->aio_type & QEMU_AIO_ZONE_APPEND) {
+            uint64_t wp = aiocb->aio_offset;
+            len = qemu_pwritev(aiocb->aio_fildes,
+                               aiocb->io.iov,
+                               aiocb->io.niov,
+                               wp);
+        } else {
             len = qemu_preadv(aiocb->aio_fildes,
                               aiocb->io.iov,
                               aiocb->io.niov,
                               aiocb->aio_offset);
+        }
     } while (len == -1 && errno == EINTR);
-
     if (len == -1) {
         return -errno;
     }
@@ -1604,6 +1629,12 @@ static ssize_t handle_aiocb_rw_linear(RawPosixAIOData *aiocb, char *buf)
                          (const char *)buf + offset,
                          aiocb->aio_nbytes - offset,
                          aiocb->aio_offset + offset);
+        } else if (aiocb->aio_type == QEMU_AIO_ZONE_APPEND) {
+            uint64_t wp = aiocb->aio_offset;
+            len = pwrite(aiocb->aio_fildes,
+                         (const char *)buf + offset,
+                         aiocb->aio_nbytes - offset,
+                         wp + offset);
         } else {
             len = pread(aiocb->aio_fildes,
                         buf + offset,
@@ -1638,7 +1669,6 @@ static int handle_aiocb_rw(void *opaque)
     RawPosixAIOData *aiocb = opaque;
     ssize_t nbytes;
     char *buf;
-
     if (!(aiocb->aio_type & QEMU_AIO_MISALIGNED)) {
         /*
          * If there is just a single buffer, and it is properly aligned
@@ -1692,7 +1722,7 @@ static int handle_aiocb_rw(void *opaque)
     }
 
     nbytes = handle_aiocb_rw_linear(aiocb, buf);
-    if (!(aiocb->aio_type & QEMU_AIO_WRITE)) {
+    if (!(aiocb->aio_type & (QEMU_AIO_WRITE | QEMU_AIO_ZONE_APPEND))) {
         char *p = buf;
         size_t count = aiocb->aio_nbytes, copy;
         int i;
@@ -1713,6 +1743,25 @@ static int handle_aiocb_rw(void *opaque)
 
 out:
     if (nbytes == aiocb->aio_nbytes) {
+#if defined(CONFIG_BLKZONED)
+        if (aiocb->aio_type & (QEMU_AIO_WRITE | QEMU_AIO_ZONE_APPEND)) {
+            BlockZoneDescriptor *zone = aiocb->io.zone;
+            int64_t nr_sectors = aiocb->aio_nbytes / 512;
+            if (zone) {
+                qemu_mutex_init(&zone->lock);
+                if (zone->type == BLK_ZT_SWR) {
+                    qemu_mutex_lock(&zone->lock);
+                    zone->wp += nr_sectors;
+                    qemu_mutex_unlock(&zone->lock);
+                }
+                qemu_mutex_destroy(&zone->lock);
+
+                if (aiocb->aio_type & QEMU_AIO_ZONE_APPEND) {
+                    *aiocb->io.append_sector = zone->wp;
+                }
+            }
+        }
+#endif
         return 0;
     } else if (nbytes >= 0 && nbytes < aiocb->aio_nbytes) {
         if (aiocb->aio_type & QEMU_AIO_WRITE) {
@@ -1724,6 +1773,13 @@ out:
         }
     } else {
         assert(nbytes < 0);
+        if (aiocb->aio_type == QEMU_AIO_ZONE_APPEND) {
+            BDRVRawState *s = aiocb->bs->opaque;
+            qemu_co_rwlock_init(&s->zones_lock);
+            qemu_co_rwlock_rdlock(&s->zones_lock);
+            do_zone_report(0, aiocb->aio_fildes, aiocb->bs->bl.zones, aiocb->bs->bl.nr_zones);
+            qemu_co_rwlock_unlock(&s->zones_lock);
+        }
         return nbytes;
     }
 }
@@ -2012,23 +2068,51 @@ static int handle_aiocb_zone_report(void *opaque) {
 static int handle_aiocb_zone_mgmt(void *opaque) {
 #if defined(CONFIG_BLKZONED)
     RawPosixAIOData *aiocb = opaque;
+    BlockDriverState *bs = aiocb->bs;
     int fd = aiocb->aio_fildes;
     int64_t sector = aiocb->aio_offset / 512;
     int64_t nr_sectors = aiocb->aio_nbytes / 512;
     struct blk_zone_range range;
+    unsigned long zone_op = aiocb->zone_mgmt.zone_op;
     int ret;
+
+    BlockZoneDescriptor *zones;
+    zones = bs->bl.zones;
+    int index = sector / bs->bl.zone_sectors;
 
     /* Execute the operation */
     range.sector = sector;
     range.nr_sectors = nr_sectors;
     do {
-        ret = ioctl(fd, aiocb->zone_mgmt.zone_op, &range);
+        ret = ioctl(fd, zone_op, &range);
     } while (ret != 0 && errno == EINTR);
 
     if (ret != 0) {
         error_report("ioctl %s failed %d", aiocb->zone_mgmt.zone_op_name,
                      errno);
         return -errno;
+    }
+    
+    if (aiocb->zone_mgmt.all) {
+        for (int i = 0; i < bs->bl.nr_zones; ++i) {
+            qemu_mutex_init(&zones[i].lock);
+            qemu_mutex_lock(&zones[i].lock);
+            zones[i].wp = zones[i].start;
+            qemu_mutex_unlock(&zones[i].lock);
+            qemu_mutex_destroy(&zones[i].lock);
+        }
+    } else if (zone_op == BLKRESETZONE) {
+        qemu_mutex_init(&zones[index].lock);
+        qemu_mutex_lock(&zones[index].lock);
+        zones[index].wp = zones[index].start;
+        qemu_mutex_unlock(&zones[index].lock);
+        qemu_mutex_destroy(&zones[index].lock);
+    } else if (zone_op == BLKFINISHZONE) {
+        qemu_mutex_init(&zones[index].lock);
+        qemu_mutex_lock(&zones[index].lock);
+        zones[index].wp = zones[index].start + zones[index].length;
+        qemu_mutex_unlock(&zones[index].lock);
+        qemu_mutex_destroy(&zones[index].lock);
     }
     return ret;
 #else
@@ -2340,6 +2424,17 @@ static int coroutine_fn raw_co_prw(BlockDriverState *bs, uint64_t offset,
         },
     };
 
+    int64_t sector = offset / 512;
+    struct stat st;
+    if (fstat(s->fd, &st)) {
+        return -1;
+    }
+    int64_t zone_sector = get_sysfs_long_val(&st, "chunk_sectors");
+    if (zone_sector > 0) {
+        int index = sector / bs->bl.zone_sectors;
+        BlockZoneDescriptor *zone = &bs->bl.zones[index];
+        acb.io.zone = zone;
+    }
     assert(qiov->size == bytes);
     return raw_thread_pool_submit(bs, handle_aiocb_rw, &acb);
 }
@@ -2448,6 +2543,9 @@ static void raw_aio_attach_aio_context(BlockDriverState *bs,
 static void raw_close(BlockDriverState *bs)
 {
     BDRVRawState *s = bs->opaque;
+#if defined(CONFIG_BLKZONED)
+    g_free(bs->bl.zones);
+#endif
 
     if (s->fd >= 0) {
         qemu_close(s->fd);
@@ -3283,6 +3381,11 @@ static int coroutine_fn raw_co_zone_mgmt(BlockDriverState *bs, BlockZoneOp op,
         zone_op_name = "BLKRESETZONE";
         zone_op = BLKRESETZONE;
         break;
+    case BLK_ZO_RESET_ALL:
+        zone_op_name = "BLKRESETZONE";
+        zone_op = BLKRESETZONE;
+        is_all = true;
+        break;
     default:
         g_assert_not_reached();
     }
@@ -3301,6 +3404,59 @@ static int coroutine_fn raw_co_zone_mgmt(BlockDriverState *bs, BlockZoneOp op,
     };
 
     return raw_thread_pool_submit(bs, handle_aiocb_zone_mgmt, &acb);
+#else
+    return -ENOTSUP;
+#endif
+}
+
+static int coroutine_fn raw_co_zone_append(BlockDriverState *bs,
+                                           int64_t *offset,
+                                           QEMUIOVector *qiov,
+                                           BdrvRequestFlags flags) {
+#if defined(CONFIG_BLKZONED)
+    BDRVRawState *s = bs->opaque;
+    int64_t zone_sector = bs->bl.zone_sectors;
+    int64_t zone_sector_mask = zone_sector - 1;
+    int64_t iov_len = 0;
+    int64_t len = 0;
+    RawPosixAIOData acb;
+
+    if (*offset & zone_sector_mask) {
+        error_report("offset %" PRId64 " is not aligned to zone size "
+                     "%" PRId64 "", *offset, zone_sector);
+        return -EINVAL;
+    }
+
+    int64_t lbsz = bs->bl.logical_block_size;
+    int64_t lbsz_mask = lbsz - 1;
+    for (int i = 0; i < qiov->niov; i++) {
+       iov_len = qiov->iov[i].iov_len;
+       if (iov_len & lbsz_mask) {
+           error_report("len of IOVector[%d] %" PRId64 " is not aligned to block "
+                        "size %" PRId64 "", i, iov_len, lbsz);
+           return -EINVAL;
+       }
+       len += iov_len;
+    }
+
+    int64_t sector = *offset / 512; //??? did not multiply before
+    BlockZoneDescriptor *zone = &bs->bl.zones[sector/zone_sector];
+
+    acb = (RawPosixAIOData) {
+        .bs = bs,
+        .aio_fildes = s->fd,
+        .aio_type = QEMU_AIO_ZONE_APPEND,
+        .aio_offset = zone->wp * 512,
+        .aio_nbytes = len,
+        .io = {
+                .iov = qiov->iov,
+                .niov = qiov->niov,
+                .zone = zone,
+                .append_sector = offset,
+        },
+    };
+
+    return raw_thread_pool_submit(bs, handle_aiocb_rw, &acb);
 #else
     return -ENOTSUP;
 #endif
@@ -4081,6 +4237,7 @@ static BlockDriver bdrv_zoned_host_device = {
     /* zone management operations */
     .bdrv_co_zone_report = raw_co_zone_report,
     .bdrv_co_zone_mgmt = raw_co_zone_mgmt,
+    .bdrv_co_zone_append = raw_co_zone_append,
 };
 #endif
 
