@@ -58,6 +58,7 @@ typedef enum BlockZoneOp {
     BLK_ZO_CLOSE,
     BLK_ZO_FINISH,
     BLK_ZO_RESET,
+    BLK_ZO_RESET_ALL,
 } BlockZoneOp;
 
 typedef enum BlockZoneModel {
@@ -95,6 +96,14 @@ typedef struct BlockZoneDescriptor {
     BlockZoneType type;
     BlockZoneCondition cond;
 } BlockZoneDescriptor;
+
+/*
+ * Track write pointers of a zone in bytes.
+ */
+typedef struct BlockZoneWps {
+    QemuMutex lock;
+    uint64_t wp[];
+} BlockZoneWps;
 
 typedef struct BlockDriverInfo {
     /* in bytes, 0 if irrelevant */
@@ -208,6 +217,13 @@ typedef enum {
 
 #define BDRV_SECTOR_BITS   9
 #define BDRV_SECTOR_SIZE   (1ULL << BDRV_SECTOR_BITS)
+
+/*
+ * Get the first most significant bit of WP. If it is zero, then
+ * the zone type is SWR.
+ */
+#define BDRV_ZT_IS_SWR(WP)    ((WP & 0x8000000000000000) == 0) ? (true) : \
+                              (false)
 
 #define BDRV_REQUEST_MAX_SECTORS MIN_CONST(SIZE_MAX >> BDRV_SECTOR_BITS, \
                                            INT_MAX >> BDRV_SECTOR_BITS)

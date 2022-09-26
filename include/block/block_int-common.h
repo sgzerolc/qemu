@@ -857,6 +857,11 @@ typedef struct BlockLimits {
 
     /* device capacity expressed in bytes */
     int64_t capacity;
+
+    /* array of write pointers' location of each zone in the zoned device. */
+    BlockZoneWps *wps;
+
+    int64_t write_granularity;
 } BlockLimits;
 
 typedef struct BdrvOpBlocker BdrvOpBlocker;

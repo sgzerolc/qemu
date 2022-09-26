@@ -206,6 +206,8 @@ typedef struct RawPosixAIOData {
         struct {
             struct iovec *iov;
             int niov;
+            int64_t *append_sector;
+            BlockZoneWps *wps;
         } io;
         struct {
             uint64_t cmd;
@@ -1332,6 +1334,59 @@ static int hdev_get_max_segments(int fd, struct stat *st) {
 #endif
 }
 
+#if defined(CONFIG_BLKZONED)
+static int report_zone_wp(int64_t offset, int fd, BlockZoneWps *wps,
+                          unsigned int nrz) {
+    struct blk_zone *blkz;
+    int64_t rep_size;
+    int64_t sector = offset >> BDRV_SECTOR_BITS;
+    int ret, n = 0, i = 0;
+
+    rep_size = sizeof(struct blk_zone_report) + nrz * sizeof(struct blk_zone);
+    g_autofree struct blk_zone_report *rep = NULL;
+    rep = g_malloc(rep_size);
+
+    blkz = (struct blk_zone *)(rep + 1);
+    while (n < nrz) {
+        memset(rep, 0, rep_size);
+        rep->sector = sector;
+        rep->nr_zones = nrz - n;
+
+        do {
+            ret = ioctl(fd, BLKREPORTZONE, rep);
+        } while (ret != 0 && errno == EINTR);
+        if (ret != 0) {
+            error_report("%d: ioctl BLKREPORTZONE at %" PRId64 " failed %d",
+                    fd, offset, errno);
+            return -errno;
+        }
+
+        if (!rep->nr_zones) {
+            break;
+        }
+
+        for (i = 0; i < rep->nr_zones; i++, n++) {
+            wps->wp[i] = blkz[i].wp << BDRV_SECTOR_BITS;
+            sector = blkz[i].start + blkz[i].len;
+
+            /*
+             * In the wp tracking, it only cares if the zone type is sequential
+             * writes required so that the wp can advance to the right location.
+             * Instead of the type of zone_type which is an 8-bit unsigned
+             * integer, use the first most significant bits of the wp location
+             * to indicate the zone type: 0 for SWR zones and 1 for the
+             * others.
+             */
+            if (!(blkz[i].type & BLK_ZONE_TYPE_SEQWRITE_REQ)) {
+                wps->wp[i] += (uint64_t)1 << 63;
+            }
+        }
+    }
+
+    return 0;
+}
+#endif
+
 static void raw_refresh_limits(BlockDriverState *bs, Error **errp)
 {
     BDRVRawState *s = bs->opaque;
@@ -1413,6 +1468,20 @@ static void raw_refresh_limits(BlockDriverState *bs, Error **errp)
         ret = ioctl(s->fd, BLKGETSIZE64, &bs->bl.capacity);
         if (ret != 0) {
             error_report("Invalid device capacity %" PRId64 " bytes ", bs->bl.capacity);
+            return;
+        }
+
+        ret = get_sysfs_long_val(&st, "physical_block_size");
+        if (ret >= 0) {
+            bs->bl.write_granularity = ret;
+        }
+
+        bs->bl.wps = g_malloc(sizeof(BlockZoneWps) + sizeof(int64_t) * ret);
+        qemu_mutex_init(&bs->bl.wps->lock);
+        if (report_zone_wp(0, s->fd, bs->bl.wps, ret) < 0 ) {
+            error_report("report wps failed");
+            qemu_mutex_destroy(&bs->bl.wps->lock);
+            g_free(bs->bl.wps);
             return;
         }
     }
@@ -1582,7 +1651,7 @@ static ssize_t handle_aiocb_rw_vector(RawPosixAIOData *aiocb)
     ssize_t len;
 
     do {
-        if (aiocb->aio_type & QEMU_AIO_WRITE)
+        if (aiocb->aio_type & (QEMU_AIO_WRITE | QEMU_AIO_ZONE_APPEND))
             len = qemu_pwritev(aiocb->aio_fildes,
                                aiocb->io.iov,
                                aiocb->io.niov,
@@ -1612,7 +1681,7 @@ static ssize_t handle_aiocb_rw_linear(RawPosixAIOData *aiocb, char *buf)
     ssize_t len;
 
     while (offset < aiocb->aio_nbytes) {
-        if (aiocb->aio_type & QEMU_AIO_WRITE) {
+        if (aiocb->aio_type & (QEMU_AIO_WRITE | QEMU_AIO_ZONE_APPEND)) {
             len = pwrite(aiocb->aio_fildes,
                          (const char *)buf + offset,
                          aiocb->aio_nbytes - offset,
@@ -1705,7 +1774,7 @@ static int handle_aiocb_rw(void *opaque)
     }
 
     nbytes = handle_aiocb_rw_linear(aiocb, buf);
-    if (!(aiocb->aio_type & QEMU_AIO_WRITE)) {
+    if (!(aiocb->aio_type & (QEMU_AIO_WRITE | QEMU_AIO_ZONE_APPEND))) {
         char *p = buf;
         size_t count = aiocb->aio_nbytes, copy;
         int i;
@@ -1726,6 +1795,23 @@ static int handle_aiocb_rw(void *opaque)
 
 out:
     if (nbytes == aiocb->aio_nbytes) {
+#if defined(CONFIG_BLKZONED)
+        if (aiocb->aio_type & (QEMU_AIO_WRITE | QEMU_AIO_ZONE_APPEND)) {
+            BlockZoneWps *wps = aiocb->io.wps;
+            int index = aiocb->aio_offset / aiocb->bs->bl.zone_size;
+            if (wps) {
+               if (BDRV_ZT_IS_SWR(wps->wp[index])) {
+                    qemu_mutex_lock(&wps->lock);
+                    wps->wp[index] += aiocb->aio_nbytes;
+                    qemu_mutex_unlock(&wps->lock);
+                }
+
+                if (aiocb->aio_type & QEMU_AIO_ZONE_APPEND) {
+                    *aiocb->io.append_sector = wps->wp[index] >> BDRV_SECTOR_BITS;
+                }
+            }
+        }
+#endif
         return 0;
     } else if (nbytes >= 0 && nbytes < aiocb->aio_nbytes) {
         if (aiocb->aio_type & QEMU_AIO_WRITE) {
@@ -1737,6 +1823,19 @@ out:
         }
     } else {
         assert(nbytes < 0);
+#if defined(CONFIG_BLKZONED)
+        if (aiocb->aio_type == QEMU_AIO_ZONE_APPEND) {
+            qemu_mutex_lock(&aiocb->bs->bl.wps->lock);
+            if (report_zone_wp(0, aiocb->aio_fildes, aiocb->bs->bl.wps,
+                           aiocb->bs->bl.nr_zones) < 0) {
+                error_report("report zone wp failed");
+                qemu_mutex_destroy(&aiocb->bs->bl.wps->lock);
+                g_free(aiocb->bs->bl.wps);
+                return -EINVAL;
+            }
+            qemu_mutex_unlock(&aiocb->bs->bl.wps->lock);
+        }
+#endif
         return nbytes;
     }
 }
@@ -2027,11 +2126,15 @@ static int handle_aiocb_zone_report(void *opaque) {
 static int handle_aiocb_zone_mgmt(void *opaque) {
 #if defined(CONFIG_BLKZONED)
     RawPosixAIOData *aiocb = opaque;
+    BlockDriverState *bs = aiocb->bs;
     int fd = aiocb->aio_fildes;
     int64_t sector = aiocb->aio_offset / 512;
     int64_t nr_sectors = aiocb->aio_nbytes / 512;
     struct blk_zone_range range;
     int ret;
+
+    BlockZoneWps *wps = bs->bl.wps;
+    int index = aiocb->aio_offset / bs->bl.zone_size;
 
     /* Execute the operation */
     range.sector = sector;
@@ -2044,6 +2147,22 @@ static int handle_aiocb_zone_mgmt(void *opaque) {
         error_report("ioctl %s failed %d", aiocb->zone_mgmt.zone_op_name,
                      errno);
         return -errno;
+    }
+    
+    if (aiocb->zone_mgmt.all) {
+        for (int i = 0; i < bs->bl.nr_zones; ++i) {
+            qemu_mutex_lock(&wps->lock);
+            wps->wp[i] = i * bs->bl.zone_size;
+            qemu_mutex_unlock(&wps->lock);
+        }
+    } else if (aiocb->zone_mgmt.zone_op == BLKRESETZONE) {
+        qemu_mutex_lock(&wps->lock);
+        wps->wp[index] = aiocb->aio_offset;
+        qemu_mutex_unlock(&wps->lock);
+    } else if (aiocb->zone_mgmt.zone_op == BLKFINISHZONE) {
+        qemu_mutex_lock(&wps->lock);
+        wps->wp[index] = aiocb->aio_offset + bs->bl.zone_size;
+        qemu_mutex_unlock(&wps->lock);
     }
     return ret;
 #else
@@ -2355,6 +2474,8 @@ static int coroutine_fn raw_co_prw(BlockDriverState *bs, uint64_t offset,
         },
     };
 
+    BlockZoneWps *wps = bs->bl.wps;
+    acb.io.wps = wps;
     assert(qiov->size == bytes);
     return raw_thread_pool_submit(bs, handle_aiocb_rw, &acb);
 }
@@ -2465,6 +2586,12 @@ static void raw_close(BlockDriverState *bs)
     BDRVRawState *s = bs->opaque;
 
     if (s->fd >= 0) {
+#if defined(CONFIG_BLKZONED)
+        if (bs->bl.wps) {
+            qemu_mutex_destroy(&bs->bl.wps->lock);
+            g_free(bs->bl.wps);
+        }
+#endif
         qemu_close(s->fd);
         s->fd = -1;
     }
@@ -3298,6 +3425,11 @@ static int coroutine_fn raw_co_zone_mgmt(BlockDriverState *bs, BlockZoneOp op,
     case BLK_ZO_RESET:
         zone_op_name = "BLKRESETZONE";
         zone_op = BLKRESETZONE;
+        break;
+    case BLK_ZO_RESET_ALL:
+        zone_op_name = "BLKRESETZONE";
+        zone_op = BLKRESETZONE;
+        is_all = true;
         break;
     default:
         g_assert_not_reached();
