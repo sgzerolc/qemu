@@ -1657,7 +1657,7 @@ static ssize_t handle_aiocb_rw_vector(RawPosixAIOData *aiocb)
     ssize_t len;
 
     do {
-        if (aiocb->aio_type & QEMU_AIO_WRITE)
+        if (aiocb->aio_type & (QEMU_AIO_WRITE | QEMU_AIO_ZONE_APPEND))
             len = qemu_pwritev(aiocb->aio_fildes,
                                aiocb->io.iov,
                                aiocb->io.niov,
@@ -1687,7 +1687,7 @@ static ssize_t handle_aiocb_rw_linear(RawPosixAIOData *aiocb, char *buf)
     ssize_t len;
 
     while (offset < aiocb->aio_nbytes) {
-        if (aiocb->aio_type & QEMU_AIO_WRITE) {
+        if (aiocb->aio_type & (QEMU_AIO_WRITE | QEMU_AIO_ZONE_APPEND)) {
             len = pwrite(aiocb->aio_fildes,
                          (const char *)buf + offset,
                          aiocb->aio_nbytes - offset,
@@ -1731,7 +1731,7 @@ static int handle_aiocb_rw(void *opaque)
      * The offset of regular writes, append writes is the wp location
      * of that zone.
      */
-    if (aiocb->aio_type & QEMU_AIO_WRITE) {
+    if (aiocb->aio_type & (QEMU_AIO_WRITE | QEMU_AIO_ZONE_APPEND)) {
         if (aiocb->bs->bl.zone_size > 0) {
             BlockZoneWps *wps = aiocb->bs->bl.wps;
             qemu_mutex_lock(&wps->lock);
@@ -1794,7 +1794,7 @@ static int handle_aiocb_rw(void *opaque)
     }
 
     nbytes = handle_aiocb_rw_linear(aiocb, buf);
-    if (!(aiocb->aio_type & QEMU_AIO_WRITE)) {
+    if (!(aiocb->aio_type & (QEMU_AIO_WRITE | QEMU_AIO_ZONE_APPEND))) {
         char *p = buf;
         size_t count = aiocb->aio_nbytes, copy;
         int i;
@@ -1816,7 +1816,7 @@ static int handle_aiocb_rw(void *opaque)
 out:
     if (nbytes == aiocb->aio_nbytes) {
 #if defined(CONFIG_BLKZONED)
-        if (aiocb->aio_type & QEMU_AIO_WRITE) {
+        if (aiocb->aio_type & (QEMU_AIO_WRITE | QEMU_AIO_ZONE_APPEND)) {
             BlockZoneWps *wps = aiocb->bs->bl.wps;
             int index = aiocb->aio_offset / aiocb->bs->bl.zone_size;
             if (wps) {
@@ -1827,6 +1827,11 @@ out:
                     /* Advance the wp if needed */
                     if (wend_offset > wps->wp[index]){
                         wps->wp[index] = wend_offset;
+                    }
+
+                    if (aiocb->aio_type & QEMU_AIO_ZONE_APPEND) {
+                        *aiocb->io.append_sector =
+                                wps->wp[index] >> BDRV_SECTOR_BITS;
                     }
                 }
                 qemu_mutex_unlock(&wps->lock);
@@ -1845,7 +1850,7 @@ out:
     } else {
         assert(nbytes < 0);
 #if defined(CONFIG_BLKZONED)
-        if (aiocb->aio_type & QEMU_AIO_WRITE) {
+        if (aiocb->aio_type & (QEMU_AIO_WRITE | QEMU_AIO_ZONE_APPEND)) {
             update_zones_wp(0, aiocb->aio_fildes, aiocb->bs->bl.wps,
                             aiocb->bs->bl.nr_zones);
         }
@@ -3493,6 +3498,52 @@ static int coroutine_fn raw_co_zone_mgmt(BlockDriverState *bs, BlockZoneOp op,
 }
 #endif
 
+#if defined(CONFIG_BLKZONED)
+static int coroutine_fn raw_co_zone_append(BlockDriverState *bs,
+                                           int64_t *offset,
+                                           QEMUIOVector *qiov,
+                                           BdrvRequestFlags flags) {
+    BDRVRawState *s = bs->opaque;
+    int64_t zone_size_mask = bs->bl.zone_size - 1;
+    int64_t iov_len = 0;
+    int64_t len = 0;
+    RawPosixAIOData acb;
+
+    if (*offset & zone_size_mask) {
+        error_report("sector offset %" PRId64 " is not aligned to zone size "
+                     "%" PRId32 "", *offset / 512, bs->bl.zone_size / 512);
+        return -EINVAL;
+    }
+
+    int64_t wg = bs->bl.write_granularity;
+    int64_t wg_mask = wg - 1;
+    for (int i = 0; i < qiov->niov; i++) {
+       iov_len = qiov->iov[i].iov_len;
+       if (iov_len & wg_mask) {
+           error_report("len of IOVector[%d] %" PRId64 " is not aligned to block "
+                        "size %" PRId64 "", i, iov_len, wg);
+           return -EINVAL;
+       }
+       len += iov_len;
+    }
+
+    acb = (RawPosixAIOData) {
+        .bs = bs,
+        .aio_fildes = s->fd,
+        .aio_type = QEMU_AIO_ZONE_APPEND,
+        .aio_offset = *offset,
+        .aio_nbytes = len,
+        .io = {
+                .iov = qiov->iov,
+                .niov = qiov->niov,
+                .append_sector = offset,
+        },
+    };
+
+    return raw_thread_pool_submit(bs, handle_aiocb_rw, &acb);
+}
+#endif
+
 static coroutine_fn int
 raw_do_pdiscard(BlockDriverState *bs, int64_t offset, int64_t bytes,
                 bool blkdev)
@@ -4268,6 +4319,7 @@ static BlockDriver bdrv_zoned_host_device = {
     /* zone management operations */
     .bdrv_co_zone_report = raw_co_zone_report,
     .bdrv_co_zone_mgmt = raw_co_zone_mgmt,
+    .bdrv_co_zone_append = raw_co_zone_append,
 };
 #endif
 
