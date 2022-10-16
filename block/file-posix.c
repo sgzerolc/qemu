@@ -205,6 +205,7 @@ typedef struct RawPosixAIOData {
         struct {
             struct iovec *iov;
             int niov;
+            int64_t *offset;
         } io;
         struct {
             uint64_t cmd;
@@ -1475,6 +1476,11 @@ static void raw_refresh_limits(BlockDriverState *bs, Error **errp)
             bs->bl.max_active_zones = ret;
         }
 
+        ret = get_sysfs_long_val(&st, "physical_block_size");
+        if (ret >= 0) {
+            bs->bl.write_granularity = ret;
+        }
+
         bs->bl.wps = g_malloc(sizeof(BlockZoneWps) + sizeof(int64_t) * ret);
         if (get_zones_wp(s->fd, bs->bl.wps, 0, ret) < 0) {
             error_report("report wps failed");
@@ -1647,9 +1653,18 @@ qemu_pwritev(int fd, const struct iovec *iov, int nr_iov, off_t offset)
 static ssize_t handle_aiocb_rw_vector(RawPosixAIOData *aiocb)
 {
     ssize_t len;
+    BlockZoneWps *wps = aiocb->bs->bl.wps;
+    int index = aiocb->aio_offset / aiocb->bs->bl.zone_size;
+
+    if (wps) {
+        qemu_mutex_lock(&wps->lock);
+        if (aiocb->aio_type & QEMU_AIO_ZONE_APPEND) {
+            aiocb->aio_offset = wps->wp[index];
+        }
+    }
 
     do {
-        if (aiocb->aio_type & QEMU_AIO_WRITE)
+        if (aiocb->aio_type & (QEMU_AIO_WRITE | QEMU_AIO_ZONE_APPEND))
             len = qemu_pwritev(aiocb->aio_fildes,
                                aiocb->io.iov,
                                aiocb->io.niov,
@@ -1660,6 +1675,9 @@ static ssize_t handle_aiocb_rw_vector(RawPosixAIOData *aiocb)
                               aiocb->io.niov,
                               aiocb->aio_offset);
     } while (len == -1 && errno == EINTR);
+    if (wps) {
+        qemu_mutex_unlock(&wps->lock);
+    }
 
     if (len == -1) {
         return -errno;
@@ -1677,9 +1695,17 @@ static ssize_t handle_aiocb_rw_linear(RawPosixAIOData *aiocb, char *buf)
 {
     ssize_t offset = 0;
     ssize_t len;
+    BlockZoneWps *wps = aiocb->bs->bl.wps;
+    int index = aiocb->aio_offset / aiocb->bs->bl.zone_size;
 
+    if (wps) {
+        qemu_mutex_lock(&wps->lock);
+        if (aiocb->aio_type & QEMU_AIO_ZONE_APPEND) {
+            aiocb->aio_offset = wps->wp[index];
+        }
+    }
     while (offset < aiocb->aio_nbytes) {
-        if (aiocb->aio_type & QEMU_AIO_WRITE) {
+        if (aiocb->aio_type & (QEMU_AIO_WRITE | QEMU_AIO_ZONE_APPEND)) {
             len = pwrite(aiocb->aio_fildes,
                          (const char *)buf + offset,
                          aiocb->aio_nbytes - offset,
@@ -1708,6 +1734,9 @@ static ssize_t handle_aiocb_rw_linear(RawPosixAIOData *aiocb, char *buf)
             break;
         }
         offset += len;
+    }
+    if (wps) {
+        qemu_mutex_unlock(&wps->lock);
     }
 
     return offset;
@@ -1772,7 +1801,7 @@ static int handle_aiocb_rw(void *opaque)
     }
 
     nbytes = handle_aiocb_rw_linear(aiocb, buf);
-    if (!(aiocb->aio_type & QEMU_AIO_WRITE)) {
+    if (!(aiocb->aio_type & (QEMU_AIO_WRITE | QEMU_AIO_ZONE_APPEND))) {
         char *p = buf;
         size_t count = aiocb->aio_nbytes, copy;
         int i;
@@ -1794,7 +1823,7 @@ static int handle_aiocb_rw(void *opaque)
 out:
     if (nbytes == aiocb->aio_nbytes) {
 #if defined(CONFIG_BLKZONED)
-        if (aiocb->aio_type & QEMU_AIO_WRITE) {
+        if (aiocb->aio_type & (QEMU_AIO_WRITE | QEMU_AIO_ZONE_APPEND)) {
             BlockZoneWps *wps = aiocb->bs->bl.wps;
             int index = aiocb->aio_offset / aiocb->bs->bl.zone_size;
             if (wps) {
@@ -1802,6 +1831,9 @@ out:
                 if (!BDRV_ZT_IS_CONV(wps->wp[index])) {
                     uint64_t wend_offset =
                             aiocb->aio_offset + aiocb->aio_nbytes;
+                    if (aiocb->aio_type & QEMU_AIO_ZONE_APPEND) {
+                        *aiocb->io.offset = wps->wp[index];
+                    }
 
                     /* Advance the wp if needed */
                     if (wend_offset > wps->wp[index]) {
@@ -1824,7 +1856,7 @@ out:
     } else {
         assert(nbytes < 0);
 #if defined(CONFIG_BLKZONED)
-        if (aiocb->aio_type & QEMU_AIO_WRITE) {
+        if (aiocb->aio_type & (QEMU_AIO_WRITE | QEMU_AIO_ZONE_APPEND)) {
             update_zones_wp(aiocb->aio_fildes, aiocb->bs->bl.wps, 0, 1);
         }
 #endif
@@ -3478,6 +3510,52 @@ static int coroutine_fn raw_co_zone_mgmt(BlockDriverState *bs, BlockZoneOp op,
 }
 #endif
 
+#if defined(CONFIG_BLKZONED)
+static int coroutine_fn raw_co_zone_append(BlockDriverState *bs,
+                                           int64_t *offset,
+                                           QEMUIOVector *qiov,
+                                           BdrvRequestFlags flags) {
+    BDRVRawState *s = bs->opaque;
+    int64_t zone_size_mask = bs->bl.zone_size - 1;
+    int64_t iov_len = 0;
+    int64_t len = 0;
+    RawPosixAIOData acb;
+
+    if (*offset & zone_size_mask) {
+        error_report("sector offset %" PRId64 " is not aligned to zone size "
+                     "%" PRId32 "", *offset / 512, bs->bl.zone_size / 512);
+        return -EINVAL;
+    }
+
+    int64_t wg = bs->bl.write_granularity;
+    int64_t wg_mask = wg - 1;
+    for (int i = 0; i < qiov->niov; i++) {
+        iov_len = qiov->iov[i].iov_len;
+        if (iov_len & wg_mask) {
+            error_report("len of IOVector[%d] %" PRId64 " is not aligned to "
+                         "block size %" PRId64 "", i, iov_len, wg);
+            return -EINVAL;
+        }
+        len += iov_len;
+    }
+
+    acb = (RawPosixAIOData) {
+        .bs = bs,
+        .aio_fildes = s->fd,
+        .aio_type = QEMU_AIO_ZONE_APPEND,
+        .aio_offset = *offset,
+        .aio_nbytes = len,
+        .io = {
+                .iov = qiov->iov,
+                .niov = qiov->niov,
+                .offset = offset,
+        },
+    };
+
+    return raw_thread_pool_submit(bs, handle_aiocb_rw, &acb);
+}
+#endif
+
 static coroutine_fn int
 raw_do_pdiscard(BlockDriverState *bs, int64_t offset, int64_t bytes,
                 bool blkdev)
@@ -4253,6 +4331,7 @@ static BlockDriver bdrv_zoned_host_device = {
     /* zone management operations */
     .bdrv_co_zone_report = raw_co_zone_report,
     .bdrv_co_zone_mgmt = raw_co_zone_mgmt,
+    .bdrv_co_zone_append = raw_co_zone_append,
 };
 #endif
 
