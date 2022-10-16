@@ -1324,6 +1324,66 @@ static int hdev_get_max_segments(int fd, struct stat *st)
 #endif
 }
 
+#if defined(CONFIG_BLKZONED)
+static int get_zones_wp(int fd, BlockZoneWps *wps, int64_t offset,
+                        unsigned int nrz) {
+    struct blk_zone *blkz;
+    int64_t rep_size;
+    int64_t sector = offset >> BDRV_SECTOR_BITS;
+    int ret, n = 0, i = 0;
+    rep_size = sizeof(struct blk_zone_report) + nrz * sizeof(struct blk_zone);
+    g_autofree struct blk_zone_report *rep = NULL;
+
+    rep = g_malloc(rep_size);
+    blkz = (struct blk_zone *)(rep + 1);
+    while (n < nrz) {
+        memset(rep, 0, rep_size);
+        rep->sector = sector;
+        rep->nr_zones = nrz - n;
+
+        do {
+            ret = ioctl(fd, BLKREPORTZONE, rep);
+        } while (ret != 0 && errno == EINTR);
+        if (ret != 0) {
+            error_report("%d: ioctl BLKREPORTZONE at %" PRId64 " failed %d",
+                    fd, offset, errno);
+            return -errno;
+        }
+
+        if (!rep->nr_zones) {
+            break;
+        }
+
+        for (i = 0; i < rep->nr_zones; i++, n++) {
+            /*
+             * The wp tracking cares only about sequential writes required and
+             * sequential write preferred zones so that the wp can advance to
+             * the right location.
+             * Use the most significant bit of the wp location to indicate the
+             * zone type: 0 for SWR/SWP zones and 1 for conventional zones.
+             */
+            if (blkz[i].type == BLK_ZONE_TYPE_CONVENTIONAL) {
+                wps->wp[i] = 1ULL << 63;
+            } else {
+                wps->wp[i] = blkz[i].wp << BDRV_SECTOR_BITS;
+            }
+        }
+        sector = blkz[i - 1].start + blkz[i - 1].len;
+    }
+
+    return 0;
+}
+
+static void update_zones_wp(int fd, BlockZoneWps *wps, int64_t offset,
+                            unsigned int nrz) {
+    qemu_mutex_lock(&wps->lock);
+    if (get_zones_wp(fd, wps, offset, nrz) < 0) {
+        error_report("update zone wp failed");
+    }
+    qemu_mutex_unlock(&wps->lock);
+}
+#endif
+
 static void raw_refresh_limits(BlockDriverState *bs, Error **errp)
 {
     BDRVRawState *s = bs->opaque;
@@ -1414,6 +1474,14 @@ static void raw_refresh_limits(BlockDriverState *bs, Error **errp)
         if (ret >= 0) {
             bs->bl.max_active_zones = ret;
         }
+
+        bs->bl.wps = g_malloc(sizeof(BlockZoneWps) + sizeof(int64_t) * ret);
+        if (get_zones_wp(s->fd, bs->bl.wps, 0, ret) < 0) {
+            error_report("report wps failed");
+            g_free(bs->bl.wps);
+            return;
+        }
+        qemu_mutex_init(&bs->bl.wps->lock);
     }
 }
 
@@ -1725,6 +1793,25 @@ static int handle_aiocb_rw(void *opaque)
 
 out:
     if (nbytes == aiocb->aio_nbytes) {
+#if defined(CONFIG_BLKZONED)
+        if (aiocb->aio_type & QEMU_AIO_WRITE) {
+            BlockZoneWps *wps = aiocb->bs->bl.wps;
+            int index = aiocb->aio_offset / aiocb->bs->bl.zone_size;
+            if (wps) {
+                qemu_mutex_lock(&wps->lock);
+                if (!BDRV_ZT_IS_CONV(wps->wp[index])) {
+                    uint64_t wend_offset =
+                            aiocb->aio_offset + aiocb->aio_nbytes;
+
+                    /* Advance the wp if needed */
+                    if (wend_offset > wps->wp[index]) {
+                        wps->wp[index] = wend_offset;
+                    }
+                }
+                qemu_mutex_unlock(&wps->lock);
+            }
+        }
+#endif
         return 0;
     } else if (nbytes >= 0 && nbytes < aiocb->aio_nbytes) {
         if (aiocb->aio_type & QEMU_AIO_WRITE) {
@@ -1736,6 +1823,11 @@ out:
         }
     } else {
         assert(nbytes < 0);
+#if defined(CONFIG_BLKZONED)
+        if (aiocb->aio_type & QEMU_AIO_WRITE) {
+            update_zones_wp(aiocb->aio_fildes, aiocb->bs->bl.wps, 0, 1);
+        }
+#endif
         return nbytes;
     }
 }
@@ -2022,14 +2114,29 @@ static int handle_aiocb_zone_report(void *opaque)
 #endif
 
 #if defined(CONFIG_BLKZONED)
+static bool zone_is_empty(BlockDriverState *bs, int64_t index)
+{
+    return bs->bl.wps->wp[index] == index * bs->bl.zone_size;
+}
+
 static int handle_aiocb_zone_mgmt(void *opaque)
 {
     RawPosixAIOData *aiocb = opaque;
+    BlockDriverState *bs = aiocb->bs;
     int fd = aiocb->aio_fildes;
     int64_t sector = aiocb->aio_offset / 512;
     int64_t nr_sectors = aiocb->aio_nbytes / 512;
     struct blk_zone_range range;
     int ret;
+    uint64_t wend_offset;
+    BlockZoneWps *wps = bs->bl.wps;
+    int index = aiocb->aio_offset / bs->bl.zone_size;
+
+    if (BDRV_ZT_IS_CONV(wps->wp[index]) &&
+        aiocb->aio_nbytes != bs->bl.capacity) {
+        error_report("zone mgmt operations not allowed for conventional zones");
+        return -EIO;
+    }
 
     /* Execute the operation */
     range.sector = sector;
@@ -2038,11 +2145,42 @@ static int handle_aiocb_zone_mgmt(void *opaque)
         ret = ioctl(fd, aiocb->zone_mgmt.zone_op, &range);
     } while (ret != 0 && errno == EINTR);
     if (ret != 0) {
+        update_zones_wp(aiocb->aio_fildes, aiocb->bs->bl.wps,
+                        aiocb->aio_offset,
+                        aiocb->aio_nbytes / bs->bl.zone_size);
         ret = -errno;
         error_report("ioctl %s failed %d", aiocb->zone_mgmt.zone_op_name,
                      ret);
         return ret;
     }
+    qemu_mutex_lock(&wps->lock);
+    if (!BDRV_ZT_IS_CONV(wps->wp[index])) {
+        /*
+         * The zoned device allows the last zone smaller that the zone size.
+         */
+        if (aiocb->aio_nbytes < bs->bl.zone_size) {
+            wend_offset = aiocb->aio_offset + aiocb->aio_nbytes;
+        } else {
+            wend_offset = aiocb->aio_offset + bs->bl.zone_size;
+        }
+
+        if (!zone_is_empty(bs, index) &&
+            aiocb->zone_mgmt.zone_op == BLKRESETZONE) {
+            if (aiocb->aio_nbytes == bs->bl.capacity) {
+                for (int i = 0; i < bs->bl.nr_zones; ++i) {
+                    if (!BDRV_ZT_IS_CONV(wps->wp[index])) {
+                        wps->wp[i] = i * bs->bl.zone_size;
+                    }
+                }
+            } else {
+                wps->wp[index] = aiocb->aio_offset;
+            }
+        } else if (aiocb->zone_mgmt.zone_op == BLKFINISHZONE) {
+            wps->wp[index] = wend_offset;
+        }
+    }
+    qemu_mutex_unlock(&wps->lock);
+
     return 0;
 }
 #endif
@@ -2483,6 +2621,12 @@ static void raw_close(BlockDriverState *bs)
     BDRVRawState *s = bs->opaque;
 
     if (s->fd >= 0) {
+#if defined(CONFIG_BLKZONED)
+        if (bs->bl.wps) {
+            qemu_mutex_destroy(&bs->bl.wps->lock);
+            g_free(bs->bl.wps);
+        }
+#endif
         qemu_close(s->fd);
         s->fd = -1;
     }
