@@ -854,6 +854,9 @@ typedef struct BlockLimits {
 
     /* maximum number of active zones */
     int64_t max_active_zones;
+
+    /* array of write pointers' location of each zone in the zoned device. */
+    BlockZoneWps *wps;
 } BlockLimits;
 
 typedef struct BdrvOpBlocker BdrvOpBlocker;
