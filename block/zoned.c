@@ -71,6 +71,11 @@ static QemuOptsList zoned_create_opts = {
                         .help = "zoned",
                 },
                 {
+                        .name = BLOCK_OPT_Z_ZSIZE,
+                        .type = QEMU_OPT_SIZE,
+                        .help = "zone size",
+                },
+                {
                         .name = BLOCK_OPT_Z_NR_COV,
                         .type = QEMU_OPT_NUMBER,
                         .help = "numbers of conventional zones",
@@ -264,18 +269,19 @@ static int coroutine_fn zoned_co_zone_report(BlockDriverState *bs, int64_t offse
     }
 
     for (int i = 0; i < *nr_zones; ++i) {
-        zones[i].wp = bs->bl.wps->wp[index];
-        zones[i].start = index * bs->bl.zone_size;
-        zones[i].length = bs->bl.zone_size;
+        zones[i].start = i * s->zone_size;
+        zones[i].length = s->zone_size;
         zones[i].cap = zones[i].length;
 
-        if (!BDRV_ZT_IS_CONV(zones[i].wp)) {
+        if (!BDRV_ZT_IS_CONV(bs->bl.wps->wp[i])) {
             zones[i].type = BLK_ZT_SWR;
+            zones[i].wp = bs->bl.wps->wp[i];
         } else {
             zones[i].type = BLK_ZT_CONV;
+            zones[i].wp = zones[i].start;
         }
 
-        zones[i].state = BDRV_ZONE_STATE(zones[i].wp);
+        zones[i].state = BDRV_ZONE_STATE(zones[i].wp) - 2;
         index += 1;
     }
 
@@ -335,7 +341,7 @@ static int coroutine_fn zoned_co_create(BlockdevCreateOptions *opts,
 
     bs->bl.zoned = cpu_to_le64(zoned_opts->zoned);
     bs->bl.nr_zones = cpu_to_le64(zoned_opts->zone_nr_conv + zoned_opts->zone_nr_seq);
-    bs->bl.zone_size = cpu_to_le64(size / bs->bl.nr_zones);
+    bs->bl.zone_size = cpu_to_le64(zoned_opts->zone_size << BDRV_SECTOR_BITS);
     bs->bl.max_active_zones = cpu_to_le64(zoned_opts->max_active_zones);
     bs->bl.max_open_zones = cpu_to_le64(zoned_opts->max_open_zones);
     bs->bl.max_append_sectors = cpu_to_le64(zoned_opts->max_append_sectors);
@@ -347,10 +353,13 @@ static int coroutine_fn zoned_co_create(BlockdevCreateOptions *opts,
         /* The first most significant bit indicates zone type. */
         bs->bl.wps->wp[i] = i * bs->bl.zone_size;
         if (i < zoned_opts->zone_nr_conv) {
-            bs->bl.wps->wp[i] &= 1ULL << 63;
+            bs->bl.wps->wp[i] += 1ULL << 63;
+            printf("conv i %d wp %lb\n", i, bs->bl.wps->wp[i]);
         } else {
-            bs->bl.wps->wp[i] &= (unsigned long long)BLK_ZS_EMPTY << 60;
+            bs->bl.wps->wp[i] += (unsigned long long)(BLK_ZS_EMPTY + 2) << 60;
+            printf("seq i %d wp %lb\n", i, bs->bl.wps->wp[i]);
         }
+        printf("i %d wp %lb\n", i, bs->bl.wps->wp[i]);
     }
 
     memset(&header, 0, sizeof(header));
@@ -376,6 +385,10 @@ static int coroutine_fn zoned_co_create(BlockdevCreateOptions *opts,
     }
     printf("create: meta size 0x%lx, meta data starts at 0x%lx\n", meta_size, size-meta_size);
     ret = blk_pwrite(blk, size - meta_size, meta_size, test, 0);
+    if (ret < 0) {
+        goto exit;
+    }
+    ret = blk_flush(blk);
     if (ret < 0) {
         goto exit;
     }
@@ -406,6 +419,7 @@ static int coroutine_fn zoned_co_create_opts(BlockDriver *drv,
         { BLOCK_OPT_Z_MOZ,        "max-open-zones"},
         { BLOCK_OPT_Z_MAZ,        "max-active-zones"},
         { BLOCK_OPT_Z_MAS,        "max-append-sectors"},
+        { BLOCK_OPT_Z_ZSIZE,      "zone-size"},
         { NULL, NULL },
     };
 
