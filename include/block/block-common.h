@@ -227,6 +227,7 @@ typedef enum {
  * the zone type is SWR.
  */
 #define BDRV_ZT_IS_CONV(wp)    (wp & (1ULL << 63))
+#define BDRV_ZONE_STATE(wp)    (wp >> 60)
 
 #define BDRV_REQUEST_MAX_SECTORS MIN_CONST(SIZE_MAX >> BDRV_SECTOR_BITS, \
                                            INT_MAX >> BDRV_SECTOR_BITS)
