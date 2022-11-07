@@ -422,7 +422,6 @@ static int coroutine_fn zoned_co_zone_mgmt(BlockDriverState *bs, BlockZoneOp op,
     return ret;
 }
 
-
 static int coroutine_fn zoned_co_zone_append(BlockDriverState *bs, int64_t *offset,
                                              QEMUIOVector *qiov,
                                              BdrvRequestFlags flags)
@@ -504,13 +503,13 @@ static int coroutine_fn zoned_co_create(BlockdevCreateOptions *opts,
 
     for (i = 0; i < zoned_opts->zone_nr_conv; ++i) {
         meta[i] = i * zh.zone_size;
-        meta[i] &= 1ULL << 59;
+        meta[i] += 1ULL << 59;
         printf("0b%lb\n", meta[i]);
     }
     for (; i < zh.nr_zones; ++i) {
         meta[i] = i * zh.zone_size;
         /* For sequential zones, the first four most significant bit indicates zone states. */
-        meta[i] &= ((uint64_t)BLK_ZS_EMPTY << 60);
+        meta[i] += ((uint64_t)BLK_ZS_EMPTY << 60);
         printf("0b%lb\n", meta[i]);
     }
 
