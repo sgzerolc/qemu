@@ -236,7 +236,6 @@ static int coroutine_fn zoned_co_zone_report(BlockDriverState *bs, int64_t offse
         printf("si %d\n", si);
     }
     unsigned int nrz = *nr_zones;
-//    int ret;
 
     for (int i = 0; i < nrz; ++i) {
         zones[i].start = si * s->zone_size;
@@ -368,6 +367,8 @@ static int zoned_reset_zone(BlockDriverState *bs, uint32_t index) {
 
     *wp = index * s->zone_size;
     ZONED_SET_ZS(*wp, (uint64_t)BLK_ZS_EMPTY);
+    bdrv_pwrite(bs->file, s->size - s->meta_size + *wp, sizeof(*wp), wp, 0);
+    bdrv_flush(bs);
     return 0;
 }
 
