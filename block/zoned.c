@@ -28,7 +28,7 @@ typedef struct ZonedHeader {
     uint8_t zoned;
     uint32_t zone_nr_seq;
     uint32_t nr_zones;
-    uint64_t zone_size;
+    uint32_t zone_size;
     uint64_t size;
     uint32_t max_active_zones;
     uint32_t max_open_zones;
@@ -40,7 +40,7 @@ typedef struct BDRVZonedState {
     uint32_t zone_nr_seq;
     uint64_t size; /* device size in bytes */
     uint64_t meta_size;
-    uint64_t zone_size;
+    uint32_t zone_size;
     uint32_t max_active_zones;
     uint32_t max_open_zones;
     uint32_t max_append_sectors;
@@ -159,7 +159,7 @@ static int zoned_open(BlockDriverState *bs, QDict *options, int flags,
     s->meta_size = sizeof(uint64_t) * zh.nr_zones;
     s->nr_zones = zh.nr_zones;
     s->zone_size = zh.zone_size;
-    printf("open check zone size %ld\n", s->zone_size);
+    printf("open check zone size %d\n", s->zone_size);
     s->max_append_sectors = zh.max_append_sectors;
     s->max_active_zones = zh.max_active_zones;
     s->max_open_zones = zh.max_open_zones;
@@ -207,16 +207,22 @@ static coroutine_fn int zoned_co_preadv(BlockDriverState *bs, int64_t offset,
 
 static coroutine_fn int zoned_co_pwritev(BlockDriverState *bs, int64_t offset,
                                          int64_t bytes, QEMUIOVector *qiov,
-                                         BdrvRequestFlags flags)
+                                         BdrvRequestFlags append)
 {
+    BDRVZonedState *s = bs->opaque;
     int ret;
+
+    int index = offset / s->zone_size;
+    if (append) {
+        offset = s->wps->wp[index];
+    }
 
     ret = zoned_adjust_offset(bs, &offset, bytes, true);
     if (ret) {
         return ret;
     }
 
-    return bdrv_co_pwritev(bs->file, offset, bytes, qiov, flags);
+    return bdrv_co_pwritev(bs->file, offset, bytes, qiov, 0);
 }
 
 static int coroutine_fn zoned_co_zone_report(BlockDriverState *bs, int64_t offset,
@@ -420,7 +426,31 @@ static int coroutine_fn zoned_co_zone_append(BlockDriverState *bs, int64_t *offs
                                              QEMUIOVector *qiov,
                                              BdrvRequestFlags flags)
 {
-    return bdrv_co_zone_append(bs->file->bs, offset, qiov, flags);
+    assert(flags == 0);
+    BDRVZonedState *s = bs->opaque;
+    int64_t zone_size_mask = s->zone_size - 1;
+    int64_t iov_len = 0;
+    int64_t len = 0;
+
+    if (*offset & zone_size_mask) {
+        error_report("sector offset %" PRId64 " is not aligned to zone size "
+                     "%" PRId32 "", *offset / 512, s->zone_size / 512);
+        return -EINVAL;
+    }
+
+    int64_t wg = bs->bl.write_granularity;
+    int64_t wg_mask = wg - 1;
+    for (int i = 0; i < qiov->niov; i++) {
+        iov_len = qiov->iov[i].iov_len;
+        if (iov_len & wg_mask) {
+            error_report("len of IOVector[%d] %" PRId64 " is not aligned to "
+                         "block size %" PRId64 "", i, iov_len, wg);
+            return -EINVAL;
+        }
+        len += iov_len;
+    }
+
+    return zoned_co_pwritev(bs, *offset, len, qiov, true);
 }
 
 static void zoned_close(BlockDriverState *bs)
