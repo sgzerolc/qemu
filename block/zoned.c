@@ -19,21 +19,32 @@
 #include "migration/blocker.h"
 
 #define HEADER_MAGIC "zone"
+#define ZONED_ZT_IS_CONV(wp)    (wp & 1ULL << 59)
+#define ZONED_ZS(wp)            (wp >> 60)
+#define ZONED_SET_ZS(wp, zs)    (wp &= (zs << 60))
+
 typedef struct ZonedHeader {
-    char magic[4]; /* */
+    char magic[4];
+    uint8_t zoned;
     uint32_t zone_nr_seq;
+    uint32_t nr_zones;
     uint64_t zone_size;
     uint64_t size;
+    uint32_t max_active_zones;
+    uint32_t max_open_zones;
+    uint32_t max_append_sectors;
 } QEMU_PACKED ZonedHeader;
 
 typedef struct BDRVZonedState {
+    uint32_t nr_zones;
     uint32_t zone_nr_seq;
     uint64_t size; /* device size in bytes */
     uint64_t meta_size;
     uint64_t zone_size;
-
-    uint64_t offset;
-    uint64_t len;
+    uint32_t max_active_zones;
+    uint32_t max_open_zones;
+    uint32_t max_append_sectors;
+    BlockZoneWps *wps;
 } BDRVZonedState;
 
 static const char *const mutable_opts[] = { "offset", "size", NULL };
@@ -124,8 +135,7 @@ static int zoned_open(BlockDriverState *bs, QDict *options, int flags,
                       Error **errp)
 {
     BDRVZonedState *s = bs->opaque;
-    ZonedHeader header;
-    QemuOpts *opts = NULL;
+    ZonedHeader zh;
     int ret;
 
     bs->file = bdrv_open_child(NULL, options, "file", bs, &child_of_bds,
@@ -134,123 +144,79 @@ static int zoned_open(BlockDriverState *bs, QDict *options, int flags,
         return -EINVAL;
     }
 
-    ret = bdrv_pread(bs->file, 0, sizeof(header), &header, 0);
+    ret = bdrv_pread(bs->file, 0, sizeof(zh), &zh, 0);
     if (ret < 0) {
         goto fail;
     }
 
-    if (memcmp(header.magic, HEADER_MAGIC, 4)) {
+    if (memcmp(zh.magic, HEADER_MAGIC, 4) != 0) {
         error_setg(errp, "Image not in zoned format");
         goto fail;
     }
 
-    opts = qemu_opts_create(&zoned_runtime_opts, NULL, 0, errp);
-    if (!opts) {
-        return -EINVAL;
+    s->size = zh.size;
+    s->zone_nr_seq = zh.zone_nr_seq;
+    s->meta_size = sizeof(uint64_t) * zh.nr_zones;
+    s->nr_zones = zh.nr_zones;
+    s->zone_size = zh.zone_size;
+    printf("open check zone size %ld\n", s->zone_size);
+    s->max_append_sectors = zh.max_append_sectors;
+    s->max_active_zones = zh.max_active_zones;
+    s->max_open_zones = zh.max_open_zones;
+
+    uint64_t *temp = g_malloc(s->meta_size);
+    ret = bdrv_pread(bs->file, s->size - s->meta_size, s->meta_size, temp, 0);
+    if (ret < 0) {
+        error_report("Can not read metadata\n");
+        return ret;
     }
 
-    if (!qemu_opts_absorb_qdict(opts, options, errp)) {
-        return -EINVAL;
-    }
-
-    s->size = header.size;
-    s->zone_nr_seq = header.zone_nr_seq;
-    s->meta_size = sizeof(BlockZoneWps) + sizeof(uint64_t) * bs->bl.nr_zones;
-    s->zone_size = header.zone_size;
+    s->wps = g_malloc(sizeof(BlockZoneWps) + s->meta_size);
+    memcpy(s->wps->wp, temp, s->meta_size);
+    qemu_co_mutex_init(&s->wps->colock);
     return 0;
 
 fail:
     return ret;
 }
 
-static void zoned_refresh_limits(BlockDriverState *bs, Error **errp)
-{
-    bs->bl.request_alignment = BDRV_SECTOR_SIZE;
+static inline int zoned_adjust_offset(BlockDriverState *bs, int64_t *offset,
+                                      int64_t bytes, bool is_write) {
+    BDRVZonedState *s = bs->opaque;
+
+    if (*offset > s->size || bytes > (s->size - *offset)) {
+        return is_write ? -ENOSPC : -EINVAL;
+    }
+
+    *offset += sizeof(ZonedHeader);
+    return 0;
 }
-
-
 static coroutine_fn int zoned_co_preadv(BlockDriverState *bs, int64_t offset,
                                         int64_t bytes, QEMUIOVector *qiov,
                                         BdrvRequestFlags flags)
 {
-    return 0;
-//    int ret;
-//
-//    ret = zoned_adjust_offset(bs, &offset, bytes, false);
-//    if (ret) {
-//        return ret;
-//    }
-//
-//    BLKDBG_EVENT(bs->file, BLKDBG_READ_AIO);
-//    return bdrv_co_preadv(bs->file, offset, bytes, qiov, flags);
+    int ret;
+
+    ret = zoned_adjust_offset(bs, &offset, bytes, false);
+    if (ret) {
+        return ret;
+    }
+
+    return bdrv_co_preadv(bs->file, offset, bytes, qiov, flags);
 }
 
 static coroutine_fn int zoned_co_pwritev(BlockDriverState *bs, int64_t offset,
                                          int64_t bytes, QEMUIOVector *qiov,
-                                         BdrvRequestFlags flags) {
-    return 0;
-}
-//    void *buf = NULL;
-//    BlockDriver *drv;
-//    QEMUIOVector local_qiov;
-//    int ret;
-//
-//    if (bs->probed && offset < BLOCK_PROBE_BUF_SIZE && bytes) {
-//        /* Handling partial writes would be a pain - so we just
-//         * require that guests have 512-byte request alignment if
-//         * probing occurred */
-//        QEMU_BUILD_BUG_ON(BLOCK_PROBE_BUF_SIZE != 512);
-//        QEMU_BUILD_BUG_ON(BDRV_SECTOR_SIZE != 512);
-//        assert(offset == 0 && bytes >= BLOCK_PROBE_BUF_SIZE);
-//
-//        buf = qemu_try_blockalign(bs->file->bs, 512);
-//        if (!buf) {
-//            ret = -ENOMEM;
-//            goto fail;
-//        }
-//
-//        ret = qemu_iovec_to_buf(qiov, 0, buf, 512);
-//        if (ret != 512) {
-//            ret = -EINVAL;
-//            goto fail;
-//        }
-//
-//        drv = bdrv_probe_all(buf, 512, NULL);
-//        if (drv != bs->drv) {
-//            ret = -EPERM;
-//            goto fail;
-//        }
-//
-//        /* Use the checked buffer, a malicious guest might be overwriting its
-//         * original buffer in the background. */
-//        qemu_iovec_init(&local_qiov, qiov->niov + 1);
-//        qemu_iovec_add(&local_qiov, buf, 512);
-//        qemu_iovec_concat(&local_qiov, qiov, 512, qiov->size - 512);
-//        qiov = &local_qiov;
-//    }
-//
-//    ret = zoned_adjust_offset(bs, &offset, bytes, true);
-//    if (ret) {
-//        goto fail;
-//    }
-//
-//    BLKDBG_EVENT(bs->file, BLKDBG_WRITE_AIO);
-//    ret = bdrv_co_pwritev(bs->file, offset, bytes, qiov, flags);
-//
-//    fail:
-//    if (qiov == &local_qiov) {
-//        qemu_iovec_destroy(&local_qiov);
-//    }
-//    qemu_vfree(buf);
-//    return ret;
-//}
-
-static int coroutine_fn zoned_co_pwrite_zeroes(BlockDriverState *bs,
-                                               int64_t offset, int64_t bytes,
-                                               BdrvRequestFlags flags)
+                                         BdrvRequestFlags flags)
 {
-    return 0;
-//    return bdrv_co_pwrite_zeroes(bs->file, offset, bytes, flags);
+    int ret;
+
+    ret = zoned_adjust_offset(bs, &offset, bytes, true);
+    if (ret) {
+        return ret;
+    }
+
+    return bdrv_co_pwritev(bs->file, offset, bytes, qiov, flags);
 }
 
 static int coroutine_fn zoned_co_zone_report(BlockDriverState *bs, int64_t offset,
@@ -258,40 +224,195 @@ static int coroutine_fn zoned_co_zone_report(BlockDriverState *bs, int64_t offse
                                              BlockZoneDescriptor *zones)
 {
     BDRVZonedState *s = bs->opaque;
-    int index = offset / s->zone_size;
-    int ret;
-
-    bs->bl.wps = g_malloc(s->meta_size);
-    ret = bdrv_pread(bs->file, s->size - s->meta_size, s->meta_size, bs->bl.wps, 0);
-    if (ret < 0) {
-        error_report("Can not read metadata\n");
-        return ret;
+    int si = 0;
+    if (s->zone_size > 0) {
+        si = offset / s->zone_size;
+        printf("si %d\n", si);
     }
+    unsigned int nrz = *nr_zones;
+//    int ret;
 
-    for (int i = 0; i < *nr_zones; ++i) {
-        zones[i].start = i * s->zone_size;
+    for (int i = 0; i < nrz; ++i) {
+        zones[i].start = si * s->zone_size;
         zones[i].length = s->zone_size;
-        zones[i].cap = zones[i].length;
+        zones[i].cap = s->zone_size;
 
-        if (!BDRV_ZT_IS_CONV(bs->bl.wps->wp[i])) {
-            zones[i].type = BLK_ZT_SWR;
-            zones[i].wp = bs->bl.wps->wp[i];
-        } else {
+        uint64_t wp = s->wps->wp[si];
+        if (ZONED_ZT_IS_CONV(wp)) {
             zones[i].type = BLK_ZT_CONV;
-            zones[i].wp = zones[i].start;
+            zones[i].state = BLK_ZS_EMPTY;
+            /* Clear the zone type bit */
+            wp &= ~(1ULL << 59);
+        } else {
+            zones[i].type = BLK_ZT_SWR;
+            zones[i].state = ZONED_ZS(wp);
+            /* Clear the zone state bits */
+            wp &= ~((wp >> 60) << 60);
         }
 
-        zones[i].state = BDRV_ZONE_STATE(zones[i].wp) - 2;
-        index += 1;
+        zones[i].wp = wp;
+        printf("i%d wp 0x%lx\n", i, wp);
+        ++si;
     }
 
+    return 0;
+}
+
+static int zoned_open_zone(BlockDriverState *bs, uint32_t index) {
+    BDRVZonedState *s = bs->opaque;
+    uint64_t *wp = &s->wps->wp[index];
+    BlockZoneState zs = ZONED_ZS(*wp);
+
+    switch(zs) {
+    case BLK_ZS_EMPTY:
+        break;
+    case BLK_ZS_IOPEN:
+        s->max_open_zones--;
+        s->max_active_zones--;
+        break;
+    case BLK_ZS_EOPEN:
+        return 0;
+    case BLK_ZS_CLOSED:
+        s->max_active_zones--;
+        break;
+    case BLK_ZS_FULL:
+        return 0;
+    case BLK_ZS_NOT_WP:
+        break;
+    case BLK_ZS_OFFLINE:
+        break;
+    default:
+        return -ENOTSUP;
+    }
+
+    ZONED_SET_ZS(*wp, (uint64_t)BLK_ZS_EOPEN);
+    s->max_open_zones++;
+    return 0;
+}
+
+static int zoned_close_zone(BlockDriverState *bs, uint32_t index) {
+    BDRVZonedState *s = bs->opaque;
+    uint64_t *wp = &s->wps->wp[index];
+    ZONED_SET_ZS(*wp, (uint64_t)BLK_ZS_CLOSED);
+    return 0;
+}
+
+static int zoned_finish_zone(BlockDriverState *bs, uint32_t index) {
+    BDRVZonedState *s = bs->opaque;
+    uint64_t *wp = &s->wps->wp[index];
+    BlockZoneState zs = ZONED_ZS(*wp);
+
+    switch(zs) {
+    case BLK_ZS_EMPTY:
+        return 0;
+    case BLK_ZS_IOPEN:
+        s->max_open_zones--;
+        s->max_active_zones--;
+        break;
+    case BLK_ZS_EOPEN:
+        s->max_open_zones--;
+        s->max_active_zones--;
+        break;
+    case BLK_ZS_CLOSED:
+        s->max_active_zones--;
+        break;
+    case BLK_ZS_FULL:
+        return 0;
+    case BLK_ZS_NOT_WP:
+        break;
+    case BLK_ZS_OFFLINE:
+        break;
+    default:
+        return -ENOTSUP;
+    }
+
+    *wp = (index+1) * s->zone_size;
+    ZONED_SET_ZS(*wp, (uint64_t)BLK_ZS_FULL);
+    return 0;
+}
+
+static int zoned_reset_zone(BlockDriverState *bs, uint32_t index) {
+    BDRVZonedState *s = bs->opaque;
+    uint64_t *wp = &s->wps->wp[index];
+    BlockZoneState zs = ZONED_ZS(*wp);
+
+    switch(zs) {
+    case BLK_ZS_EMPTY:
+        return 0;
+    case BLK_ZS_IOPEN:
+        s->max_open_zones--;
+        s->max_active_zones--;
+        break;
+    case BLK_ZS_EOPEN:
+        s->max_open_zones--;
+        s->max_active_zones--;
+        break;
+    case BLK_ZS_CLOSED:
+        s->max_active_zones--;
+        break;
+    case BLK_ZS_FULL:
+        break;
+    case BLK_ZS_NOT_WP:
+        break;
+    case BLK_ZS_OFFLINE:
+        break;
+    default:
+        return -ENOTSUP;
+    }
+
+    *wp = index * s->zone_size;
+    ZONED_SET_ZS(*wp, (uint64_t)BLK_ZS_EMPTY);
     return 0;
 }
 
 static int coroutine_fn zoned_co_zone_mgmt(BlockDriverState *bs, BlockZoneOp op,
                                            int64_t offset, int64_t len)
 {
-    return 0;
+    BDRVZonedState *s = bs->opaque;
+    BlockZoneWps *wps = s->wps;
+    int ret;
+    int64_t capacity = s->size;
+    int64_t zone_size = s->zone_size;
+    int64_t zone_size_mask = zone_size - 1;
+
+    if (offset & zone_size_mask) {
+        error_report("sector offset %" PRId64 " is not aligned to zone size "
+                     "%" PRId64 "", offset / 512, zone_size / 512);
+        return -EINVAL;
+    }
+
+    if (((offset + len) < capacity && len & zone_size_mask) ||
+        offset + len > capacity) {
+        error_report("number of sectors %" PRId64 " is not aligned to zone size"
+                     " %" PRId64 "", len / 512, zone_size / 512);
+        return -EINVAL;
+    }
+    uint32_t index = offset / bs->bl.zone_size;
+    if (ZONED_ZT_IS_CONV(wps->wp[index]) && len != capacity) {
+        error_report("zone mgmt operations are not allowed for conventional zones");
+        return -EIO;
+    }
+
+    switch(op) {
+    case BLK_ZO_OPEN:
+        ret = zoned_open_zone(bs, index);
+        break;
+    case BLK_ZO_CLOSE:
+        ret = zoned_close_zone(bs, index);
+        break;
+    case BLK_ZO_FINISH:
+        ret = zoned_finish_zone(bs, index);
+        break;
+    case BLK_ZO_RESET:
+        ret = zoned_reset_zone(bs, index);
+        break;
+    default:
+        error_report("Unsupported zone op: 0x%x", op);
+        ret = -ENOTSUP;
+        break;
+    }
+
+    return ret;
 }
 
 
@@ -304,7 +425,10 @@ static int coroutine_fn zoned_co_zone_append(BlockDriverState *bs, int64_t *offs
 
 static void zoned_close(BlockDriverState *bs)
 {
-    return;
+    BDRVZonedState *s = bs->opaque;
+    if (s->wps) {
+        g_free(s->wps);
+    }
 }
 
 static int coroutine_fn zoned_co_create(BlockdevCreateOptions *opts,
@@ -313,18 +437,17 @@ static int coroutine_fn zoned_co_create(BlockdevCreateOptions *opts,
     BlockdevCreateOptionsZoned *zoned_opts;
     BlockDriverState *bs;
     BlockBackend *blk;
-    ZonedHeader header;
+    ZonedHeader zh;
     int64_t size, meta_size;
     uint8_t tmp[BDRV_SECTOR_SIZE];
-    int ret;
+    int ret, i;
 
     assert(opts->driver == BLOCKDEV_DRIVER_ZONED);
     zoned_opts = &opts->u.zoned;
     size = zoned_opts->size;
-    meta_size = sizeof(BlockZoneWps) + sizeof(uint64_t) *
-            (zoned_opts->zone_nr_seq + zoned_opts->zone_nr_conv);
-    uint8_t test[meta_size];
-
+    meta_size = sizeof(uint64_t) * (zoned_opts->zone_nr_seq + zoned_opts->zone_nr_conv);
+    uint64_t meta[meta_size];
+    memset(meta, 0, meta_size);
 
     bs = bdrv_open_blockdev_ref(zoned_opts->file, errp);
     if (bs == NULL) {
@@ -339,42 +462,32 @@ static int coroutine_fn zoned_co_create(BlockdevCreateOptions *opts,
     }
     blk_set_allow_write_beyond_eof(blk, true);
 
-    bs->bl.zoned = cpu_to_le64(zoned_opts->zoned);
-    bs->bl.nr_zones = cpu_to_le64(zoned_opts->zone_nr_conv + zoned_opts->zone_nr_seq);
-    bs->bl.zone_size = cpu_to_le64(zoned_opts->zone_size << BDRV_SECTOR_BITS);
-    bs->bl.max_active_zones = cpu_to_le64(zoned_opts->max_active_zones);
-    bs->bl.max_open_zones = cpu_to_le64(zoned_opts->max_open_zones);
-    bs->bl.max_append_sectors = cpu_to_le64(zoned_opts->max_append_sectors);
+    zh.zoned = cpu_to_le64(zoned_opts->zoned);
+    zh.nr_zones = cpu_to_le64(zoned_opts->zone_nr_conv + zoned_opts->zone_nr_seq);
+    zh.size = cpu_to_le64(size);
+    zh.zone_nr_seq = cpu_to_le64(zoned_opts->zone_nr_seq);
+    zh.zone_size = cpu_to_le64(zoned_opts->zone_size << BDRV_SECTOR_BITS);
+    zh.max_active_zones = cpu_to_le64(zoned_opts->max_active_zones);
+    zh.max_open_zones = cpu_to_le64(zoned_opts->max_open_zones);
+    zh.max_append_sectors = cpu_to_le64(zoned_opts->max_append_sectors);
 
-    bs->bl.wps = g_malloc(meta_size);
-    qemu_co_mutex_init(&bs->bl.wps->colock);
-    printf("writing wps\n");
-    for (int i = 0; i < bs->bl.nr_zones; ++i) {
-        /* The first most significant bit indicates zone type. */
-        bs->bl.wps->wp[i] = i * bs->bl.zone_size;
-        if (i < zoned_opts->zone_nr_conv) {
-            bs->bl.wps->wp[i] += 1ULL << 63;
-            printf("conv i %d wp %lb\n", i, bs->bl.wps->wp[i]);
-        } else {
-            bs->bl.wps->wp[i] += (unsigned long long)(BLK_ZS_EMPTY + 2) << 60;
-            printf("seq i %d wp %lb\n", i, bs->bl.wps->wp[i]);
-        }
-        printf("i %d wp %lb\n", i, bs->bl.wps->wp[i]);
+    for (i = 0; i < zoned_opts->zone_nr_conv; ++i) {
+        meta[i] = i * zh.zone_size;
+        meta[i] &= 1ULL << 59;
+        printf("0b%lb\n", meta[i]);
+    }
+    for (; i < zh.nr_zones; ++i) {
+        meta[i] = i * zh.zone_size;
+        /* For sequential zones, the first four most significant bit indicates zone states. */
+        meta[i] &= ((uint64_t)BLK_ZS_EMPTY << 60);
+        printf("0b%lb\n", meta[i]);
     }
 
-    memset(&header, 0, sizeof(header));
-    memcpy(header.magic, HEADER_MAGIC, sizeof(header.magic));
-    header.size = cpu_to_le64(size);
-    header.zone_nr_seq = cpu_to_le64(zoned_opts->zone_nr_seq);
-    header.zone_size = bs->bl.zone_size;
-
-    /* write headers and metadata to the file */
+    /* write zhs and metadata to the file */
+    memcpy(zh.magic, HEADER_MAGIC, sizeof(zh.magic));
     memset(tmp, 0, sizeof(tmp));
-    memset(test, 0, meta_size);
-    memcpy(tmp, &header, sizeof(header));
-    memcpy(test, bs->bl.wps, meta_size);
+    memcpy(tmp, &zh, sizeof(zh));
 
-    printf("start writing\n");
     ret = blk_pwrite(blk, 0, BDRV_SECTOR_SIZE, tmp, 0);
     if (ret < 0) {
         goto exit;
@@ -383,8 +496,7 @@ static int coroutine_fn zoned_co_create(BlockdevCreateOptions *opts,
     if (ret < 0) {
         goto exit;
     }
-    printf("create: meta size 0x%lx, meta data starts at 0x%lx\n", meta_size, size-meta_size);
-    ret = blk_pwrite(blk, size - meta_size, meta_size, test, 0);
+    ret = blk_pwrite(blk, size - meta_size, meta_size, meta, 0);
     if (ret < 0) {
         goto exit;
     }
@@ -490,15 +602,12 @@ static BlockDriver bdrv_zoned = {
         .bdrv_close		= zoned_close,
         .bdrv_child_perm = bdrv_default_perms,
         .is_format              = true,
-        .bdrv_refresh_limits    = zoned_refresh_limits,
-
         // reopen: prepare, commit, abort
 
         // metadata cache flushing: invalidate_cache, migrate_add_blocker
 
         .bdrv_co_preadv         = zoned_co_preadv,
         .bdrv_co_pwritev        = zoned_co_pwritev,
-        .bdrv_co_pwrite_zeroes = zoned_co_pwrite_zeroes,
 
         .bdrv_co_zone_report  = zoned_co_zone_report,
         .bdrv_co_zone_mgmt  = zoned_co_zone_mgmt,
