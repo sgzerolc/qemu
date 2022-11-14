@@ -190,14 +190,15 @@ static void zoned_refresh_limits(BlockDriverState *bs, Error **errp)
     printf("rl: zoned 0x%x\n", bs->bl.zoned);
     printf("refresh limits: zone size %d\n", bs->bl.zone_size);
     bs->bl.wps = s->wps;
-    bs->total_sectors = bs->bl.nr_zones * bs->bl.zone_size >> BDRV_SECTOR_SIZE;
+    bs->total_sectors = bs->bl.nr_zones * bs->bl.zone_size >> BDRV_SECTOR_BITS;
     printf("rl: new total sec %ld\n", bs->total_sectors);
 }
 
 static int zoned_probe_blocksizes(BlockDriverState *bs, BlockSizes *bsz)
 {
-//    bsz->log = BDRV_SECTOR_SIZE;
-//    bsz->phys = BDRV_SECTOR_SIZE;
+    bsz->log = BDRV_SECTOR_SIZE;
+    bsz->phys = BDRV_SECTOR_SIZE;
+    printf("probing zbs\n");
     return 0;
 }
 
