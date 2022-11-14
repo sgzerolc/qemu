@@ -1330,7 +1330,11 @@ static void virtio_blk_update_config(VirtIODevice *vdev, uint8_t *config)
         blkcfg.write_zeroes_may_unmap = 1;
         virtio_stl_p(vdev, &blkcfg.max_write_zeroes_seg, 1);
     }
+
+    printf("vb: zoned 0x%x\n", bs->bl.zoned);
+    printf("vb: zone size %d\n", bs->bl.zone_size);
     if (bs->bl.zoned != BLK_Z_NONE) {
+        printf("vb: cap %ld\n", capacity);
         switch (bs->bl.zoned) {
         case BLK_Z_HM:
             blkcfg.zoned.model = VIRTIO_BLK_Z_HM;
