@@ -190,7 +190,8 @@ static void zoned_refresh_limits(BlockDriverState *bs, Error **errp)
     printf("rl: zoned 0x%x\n", bs->bl.zoned);
     printf("refresh limits: zone size %d\n", bs->bl.zone_size);
     bs->bl.wps = s->wps;
-    bs->total_sectors = ROUND_UP(s->header.size, BDRV_SECTOR_SIZE);
+    bs->total_sectors = bs->bl.nr_zones * bs->bl.zone_size >> BDRV_SECTOR_SIZE;
+    printf("rl: new total sec %ld\n", bs->total_sectors);
 }
 
 static int zoned_probe_blocksizes(BlockDriverState *bs, BlockSizes *bsz)
@@ -264,7 +265,7 @@ static int coroutine_fn zoned_co_zone_report(BlockDriverState *bs, int64_t offse
             uint64_t wp = s->wps->wp[si];
             if (ZONED_ZT_IS_CONV(wp)) {
                 zones[i].type = BLK_ZT_CONV;
-                zones[i].state = BLK_ZS_EMPTY;
+                zones[i].state = BLK_ZS_NOT_WP;
                 /* Clear the zone type bit */
                 wp &= ~(1ULL << 59);
             } else {
@@ -275,7 +276,10 @@ static int coroutine_fn zoned_co_zone_report(BlockDriverState *bs, int64_t offse
             }
 
             zones[i].wp = wp;
-            printf("i%d wp 0x%lx\n", i, wp);
+            printf("%d: 0b%lb zone start\n", i, zones[i].start);
+            printf("%d: 0b%lb wp\n", i, wp);
+            printf("%d: 0x%lx zone start\n", i, zones[i].start);
+            printf("%d: 0x%lx wp\n", i, wp);
             ++si;
         }
     }
