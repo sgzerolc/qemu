@@ -21,7 +21,8 @@
 #define HEADER_MAGIC "zone"
 #define ZONED_ZT_IS_CONV(wp)    (wp & 1ULL << 59)
 #define ZONED_ZS(wp)            (wp >> 60)
-#define ZONED_SET_ZS(wp, zs)    (wp &= (zs << 60))
+#define ZONED_WP(wp)            ((wp << 5) >> 5)
+#define ZONED_SET_ZS(wp, zs)    (wp |= (zs << 60))
 
 typedef struct ZonedHeader {
     uint64_t size;
@@ -124,6 +125,22 @@ static int zoned_probe(const uint8_t *buf, int buf_size,
     }
 }
 
+static inline int zoned_refresh_metadata(BlockDriverState *bs)
+{
+    int ret;
+    BDRVZonedState *s = bs->opaque;
+    uint64_t *temp = g_malloc(s->meta_size);
+    ret = bdrv_pread(bs->file, s->header.size - s->meta_size, s->meta_size,
+                     temp, 0);
+    if (ret < 0) {
+        error_report("Can not read metadata\n");
+        return ret;
+    }
+
+    memcpy(s->wps->wp, temp, s->meta_size);
+    return 0;
+}
+
 /*
  * Open the emulated device.
  */
@@ -153,27 +170,14 @@ static int zoned_open(BlockDriverState *bs, QDict *options, int flags,
     s->header = zh;
     s->header_size = sizeof(zh);
     s->meta_size = sizeof(uint64_t) * zh.nr_zones;
-//    s->size = zh.size;
-//    s->zone_nr_seq = zh.zone_nr_seq;
-//    s->nr_zones = zh.nr_zones;
-//    s->zone_size = zh.zone_size;
     printf("open check zone size %d\n", s->header.zone_size);
-//    s->max_append_sectors = zh.max_append_sectors;
-//    s->max_active_zones = zh.max_active_zones;
-//    s->max_open_zones = zh.max_open_zones;
-
-    uint64_t *temp = g_malloc(s->meta_size);
-    ret = bdrv_pread(bs->file, zh.size - s->meta_size, s->meta_size, temp, 0);
-    if (ret < 0) {
-        error_report("Can not read metadata\n");
-        return ret;
-    }
-
     s->wps = g_malloc(sizeof(BlockZoneWps) + s->meta_size);
-    memcpy(s->wps->wp, temp, s->meta_size);
+    ret = zoned_refresh_metadata(bs);
+    if (ret < 0) {
+        goto fail;
+    }
     qemu_co_mutex_init(&s->wps->colock);
     return 0;
-
 fail:
     return ret;
 }
@@ -189,7 +193,6 @@ static void zoned_refresh_limits(BlockDriverState *bs, Error **errp)
     bs->bl.max_open_zones = s->header.max_open_zones;
     printf("rl: zoned 0x%x\n", bs->bl.zoned);
     printf("refresh limits: zone size %d\n", bs->bl.zone_size);
-    bs->bl.wps = s->wps;
     bs->total_sectors = bs->bl.nr_zones * bs->bl.zone_size >> BDRV_SECTOR_BITS;
     printf("rl: new total sec %ld\n", bs->total_sectors);
 }
@@ -264,6 +267,7 @@ static int coroutine_fn zoned_co_zone_report(BlockDriverState *bs, int64_t offse
             zones[i].cap = zs;
 
             uint64_t wp = s->wps->wp[si];
+            printf("wp before: 0x%lx\n", wp);
             if (ZONED_ZT_IS_CONV(wp)) {
                 zones[i].type = BLK_ZT_CONV;
                 zones[i].state = BLK_ZS_NOT_WP;
@@ -272,13 +276,12 @@ static int coroutine_fn zoned_co_zone_report(BlockDriverState *bs, int64_t offse
             } else {
                 zones[i].type = BLK_ZT_SWR;
                 zones[i].state = ZONED_ZS(wp);
+                printf("zs %d, 0x%x\n", i, zones[i].state);
                 /* Clear the zone state bits */
-                wp &= ~((wp >> 60) << 60);
+                wp = ZONED_WP(wp);
             }
 
             zones[i].wp = wp;
-            printf("%d: 0b%lb zone start\n", i, zones[i].start);
-            printf("%d: 0b%lb wp\n", i, wp);
             printf("%d: 0x%lx zone start\n", i, zones[i].start);
             printf("%d: 0x%lx wp\n", i, wp);
             ++si;
@@ -288,8 +291,9 @@ static int coroutine_fn zoned_co_zone_report(BlockDriverState *bs, int64_t offse
 }
 
 static int zoned_open_zone(BlockDriverState *bs, uint32_t index) {
-//    BDRVZonedState *s = bs->opaque;
-//    uint64_t *wp = &s->wps->wp[index];
+    BDRVZonedState *s = bs->opaque;
+    int ret;
+    uint64_t wp = ZONED_WP(s->wps->wp[index]);
 //    BlockZoneState zs = ZONED_ZS(*wp);
 //
 //    switch(zs) {
@@ -313,87 +317,88 @@ static int zoned_open_zone(BlockDriverState *bs, uint32_t index) {
 //    default:
 //        return -ENOTSUP;
 //    }
-//
-//    ZONED_SET_ZS(*wp, (uint64_t)BLK_ZS_EOPEN);
-//    s->max_open_zones++;
+
+    ZONED_SET_ZS(wp, (uint64_t)BLK_ZS_EOPEN);
+    s->wps->wp[index] = wp;
+    ret = bdrv_pwrite(bs->file, s->header.size - s->meta_size
+        + sizeof(uint64_t) * index, sizeof(uint64_t), &wp, 0);
+    if (ret < 0) {
+        goto exit;
+    }
+    ret = bdrv_co_flush(bs);
+    if (ret < 0) {
+        goto exit;
+    }
     return 0;
+exit:
+    error_report("Failed to sync metadata with file");
+    return ret;
 }
 
 static int zoned_close_zone(BlockDriverState *bs, uint32_t index) {
-//    BDRVZonedState *s = bs->opaque;
-//    uint64_t *wp = &s->wps->wp[index];
-//    ZONED_SET_ZS(*wp, (uint64_t)BLK_ZS_CLOSED);
+    BDRVZonedState *s = bs->opaque;
+    int ret;
+    uint64_t wp = ZONED_WP(s->wps->wp[index]);
+
+    ZONED_SET_ZS(wp, (uint64_t)BLK_ZS_CLOSED);
+    s->wps->wp[index] = wp;
+    ret = bdrv_pwrite(bs->file, s->header.size - s->meta_size
+        + sizeof(uint64_t) * index, sizeof(uint64_t), &wp, 0);
+    if (ret < 0) {
+        goto exit;
+    }
+    ret = bdrv_co_flush(bs);
+    if (ret < 0) {
+        goto exit;
+    }
     return 0;
+exit:
+    error_report("Failed to sync metadata with file");
+    return ret;
 }
 
 static int zoned_finish_zone(BlockDriverState *bs, uint32_t index) {
-//    BDRVZonedState *s = bs->opaque;
-//    uint64_t *wp = &s->wps->wp[index];
-//    BlockZoneState zs = ZONED_ZS(*wp);
-//
-//    switch(zs) {
-//    case BLK_ZS_EMPTY:
-//        return 0;
-//    case BLK_ZS_IOPEN:
-//        s->max_open_zones--;
-//        s->max_active_zones--;
-//        break;
-//    case BLK_ZS_EOPEN:
-//        s->max_open_zones--;
-//        s->max_active_zones--;
-//        break;
-//    case BLK_ZS_CLOSED:
-//        s->max_active_zones--;
-//        break;
-//    case BLK_ZS_FULL:
-//        return 0;
-//    case BLK_ZS_NOT_WP:
-//        break;
-//    case BLK_ZS_OFFLINE:
-//        break;
-//    default:
-//        return -ENOTSUP;
-//    }
-//
-//    *wp = (index+1) * s->zone_size;
-//    ZONED_SET_ZS(*wp, (uint64_t)BLK_ZS_FULL);
+    BDRVZonedState *s = bs->opaque;
+    int ret;
+    uint64_t wp = ZONED_WP(s->wps->wp[index]);
+
+    ZONED_SET_ZS(wp, (uint64_t)BLK_ZS_FULL);
+    s->wps->wp[index] = wp;
+    ret = bdrv_pwrite(bs->file, s->header.size - s->meta_size
+                                + sizeof(uint64_t) * index, sizeof(uint64_t), &wp, 0);
+    if (ret < 0) {
+        goto exit;
+    }
+    ret = bdrv_co_flush(bs);
+    if (ret < 0) {
+        goto exit;
+    }
     return 0;
+exit:
+    error_report("Failed to sync metadata with file");
+    return ret;
 }
 
 static int zoned_reset_zone(BlockDriverState *bs, uint32_t index) {
-//    BDRVZonedState *s = bs->opaque;
-//    uint64_t *wp = &s->wps->wp[index];
-//    BlockZoneState zs = ZONED_ZS(*wp);
-//
-//    switch(zs) {
-//    case BLK_ZS_EMPTY:
-//        return 0;
-//    case BLK_ZS_IOPEN:
-//        s->max_open_zones--;
-//        s->max_active_zones--;
-//        break;
-//    case BLK_ZS_EOPEN:
-//        s->max_open_zones--;
-//        s->max_active_zones--;
-//        break;
-//    case BLK_ZS_CLOSED:
-//        s->max_active_zones--;
-//        break;
-//    case BLK_ZS_FULL:
-//        break;
-//    case BLK_ZS_NOT_WP:
-//        break;
-//    case BLK_ZS_OFFLINE:
-//        break;
-//    default:
-//        return -ENOTSUP;
-//    }
-//
-//    *wp = index * s->zone_size;
-//    ZONED_SET_ZS(*wp, (uint64_t)BLK_ZS_EMPTY);
-//    bdrv_pwrite(bs->file, s->size - s->meta_size + *wp, sizeof(*wp), wp, 0);
-//    bdrv_flush(bs);
+    BDRVZonedState *s = bs->opaque;
+    int ret;
+    uint64_t wp = ZONED_WP(s->wps->wp[index]);
+
+    ZONED_SET_ZS(wp, (uint64_t)BLK_ZS_EMPTY);
+    s->wps->wp[index] = wp;
+    ret = bdrv_pwrite(bs->file, s->header.size - s->meta_size
+                                + sizeof(uint64_t) * index, sizeof(uint64_t), &wp, 0);
+    if (ret < 0) {
+        goto exit;
+    }
+    ret = bdrv_co_flush(bs);
+    if (ret < 0) {
+        goto exit;
+    }
     return 0;
+exit:
+    error_report("Failed to sync metadata with file");
+    return ret;
 }
 
 static int coroutine_fn zoned_co_zone_mgmt(BlockDriverState *bs, BlockZoneOp op,
@@ -402,7 +407,7 @@ static int coroutine_fn zoned_co_zone_mgmt(BlockDriverState *bs, BlockZoneOp op,
     BDRVZonedState *s = bs->opaque;
     BlockZoneWps *wps = s->wps;
     int ret;
-    int64_t capacity = s->header.size;
+    int64_t capacity = bs->total_sectors << BDRV_SECTOR_BITS;
     int64_t zone_size = s->header.zone_size;
     int64_t zone_size_mask = zone_size - 1;
 
@@ -661,7 +666,6 @@ static BlockDriver bdrv_zoned = {
         // reopen: prepare, commit, abort
 
         // metadata cache flushing: invalidate_cache, migrate_add_blocker
-
         .bdrv_co_preadv         = zoned_co_preadv,
         .bdrv_co_pwritev        = zoned_co_pwritev,
 
