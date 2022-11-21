@@ -329,7 +329,7 @@ static coroutine_fn int zoned_co_pwritev(BlockDriverState *bs, int64_t offset,
     printf("zoned: wrote %ld at %ld\n", bytes, offset);
     printf("before writing: 0x%lx\n", wp);
     wp += bytes;
-    ZONED_SET_ZS(wp, BLK_ZS_IOPEN);
+    ZONED_SET_ZS(wp, (uint64_t)BLK_ZS_IOPEN);
     s->wps->wp[index] = wp;
     printf("after writing: 0x%lx\n", wp);
     ret = bdrv_pwrite(bs->file, s->header.size - s->meta_size
