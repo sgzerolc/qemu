@@ -666,7 +666,44 @@ static int coroutine_fn zoned_co_zone_append(BlockDriverState *bs, int64_t *offs
                                              QEMUIOVector *qiov,
                                              BdrvRequestFlags flags)
 {
-    return zoned_co_pwritev(bs, *offset, qiov->size, qiov, flags);
+    assert(flags == 0);
+    int ret;
+    int64_t zone_size_mask = bs->bl.zone_size - 1;
+    int64_t iov_len = 0;
+    int64_t len = 0;
+    BDRVZonedState *s = bs->opaque;
+    int index = *offset / s->header.zone_size;
+
+    if (*offset & zone_size_mask) {
+        error_report("sector offset %" PRId64 " is not aligned to zone size "
+                     "%" PRId32 "", *offset / 512, bs->bl.zone_size / 512);
+        return -EINVAL;
+    }
+
+    int64_t wg = bs->bl.write_granularity;
+    int64_t wg_mask = wg - 1;
+    for (int i = 0; i < qiov->niov; i++) {
+        iov_len = qiov->iov[i].iov_len;
+        if (iov_len & wg_mask) {
+            error_report("len of IOVector[%d] %" PRId64 " is not aligned to "
+                         "block size %" PRId64 "", i, iov_len, wg);
+            return -EINVAL;
+        }
+        len += iov_len;
+    }
+
+    ret = zoned_co_pwritev(bs, *offset, len, qiov, 0);
+    if (ret == 0) {
+        int wp = ZONED_WP(s->wps->wp[index]);
+        *offset = wp;
+        int wp_end = *offset + len;
+        if (wp_end > ZONED_WP(wp)) {
+            ZONED_SET_ZS(wp_end, (uint64_t)BLK_ZS_IOPEN);
+            s->wps->wp[index] = wp_end;
+        }
+    }
+
+    return ret;
 }
 
 static void zoned_close(BlockDriverState *bs)
