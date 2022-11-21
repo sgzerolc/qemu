@@ -253,6 +253,8 @@ static void zoned_refresh_limits(BlockDriverState *bs, Error **errp)
     bs->bl.max_append_sectors = s->header.max_append_sectors;
     bs->bl.max_active_zones = s->header.max_active_zones;
     bs->bl.max_open_zones = s->header.max_open_zones;
+    bs->bl.write_granularity = BDRV_SECTOR_SIZE;
+    bs->bl.wps = s->wps;
     printf("rl: zoned 0x%x\n", bs->bl.zoned);
     printf("refresh limits: zone size %d\n", bs->bl.zone_size);
     bs->total_sectors = bs->bl.nr_zones * bs->bl.zone_size >> BDRV_SECTOR_BITS;
@@ -271,6 +273,7 @@ static inline int zoned_adjust_offset(BlockDriverState *bs, int64_t *offset,
                                       int64_t bytes, bool is_write) {
     BDRVZonedState *s = bs->opaque;
 
+    printf("*offset: %ld, size: %ld, len: %ld\n", *offset, s->header.size, bytes);
     if (*offset > s->header.size || bytes > (s->header.size - *offset)) {
         return is_write ? -ENOSPC : -EINVAL;
     }
@@ -282,10 +285,8 @@ static coroutine_fn int zoned_co_preadv(BlockDriverState *bs, int64_t offset,
                                         int64_t bytes, QEMUIOVector *qiov,
                                         BdrvRequestFlags flags)
 {
-    int ret;
-
-    ret = zoned_adjust_offset(bs, &offset, bytes, false);
-    if (ret) {
+    int ret = zoned_adjust_offset(bs, &offset, bytes, false);
+    if (ret < 0) {
         return ret;
     }
 
@@ -294,7 +295,7 @@ static coroutine_fn int zoned_co_preadv(BlockDriverState *bs, int64_t offset,
 
 static coroutine_fn int zoned_co_pwritev(BlockDriverState *bs, int64_t offset,
                                          int64_t bytes, QEMUIOVector *qiov,
-                                         BdrvRequestFlags append)
+                                         BdrvRequestFlags flags)
 {
     BDRVZonedState *s = bs->opaque;
     int ret;
@@ -302,15 +303,12 @@ static coroutine_fn int zoned_co_pwritev(BlockDriverState *bs, int64_t offset,
     BlockZoneState zs = ZONED_ZS(s->wps->wp[index]);
     uint64_t wp = ZONED_WP(s->wps->wp[index]);
 
-    if (append) {
-        offset = s->wps->wp[index];
-    }
-
+    printf("zoned format: write\n");
     if (zs == BLK_ZS_CLOSED || zs == BLK_ZS_EMPTY) {
         if (zs == BLK_ZS_CLOSED) {
             s->nr_zones_closed--;
             s->nr_zones_imp_open++;
-        } else if (zs == BLK_ZS_EMPTY) {
+        } else {
             s->nr_zones_imp_open++;
         }
 
@@ -320,11 +318,33 @@ static coroutine_fn int zoned_co_pwritev(BlockDriverState *bs, int64_t offset,
     }
 
     ret = zoned_adjust_offset(bs, &offset, bytes, true);
-    if (ret) {
+    if (ret < 0) {
         return ret;
     }
 
-    return bdrv_co_pwritev(bs->file, offset, bytes, qiov, 0);
+    ret = bdrv_co_pwritev(bs->file, offset, bytes, qiov, flags);
+    if (ret < 0) {
+        return ret;
+    }
+    printf("zoned: wrote %ld at %ld\n", bytes, offset);
+    printf("before writing: 0x%lx\n", wp);
+    wp += bytes;
+    ZONED_SET_ZS(wp, BLK_ZS_IOPEN);
+    s->wps->wp[index] = wp;
+    printf("after writing: 0x%lx\n", wp);
+    ret = bdrv_pwrite(bs->file, s->header.size - s->meta_size
+        + sizeof(uint64_t) * index, sizeof(uint64_t), &wp, 0);
+    if (ret < 0) {
+        goto exit;
+    }
+    ret = bdrv_co_flush(bs);
+    if (ret < 0) {
+        goto exit;
+    }
+    return 0;
+exit:
+    error_report("Failed to sync metadata with file");
+    return ret;
 }
 
 static int coroutine_fn zoned_co_zone_report(BlockDriverState *bs, int64_t offset,
@@ -597,31 +617,12 @@ static int coroutine_fn zoned_co_zone_append(BlockDriverState *bs, int64_t *offs
                                              QEMUIOVector *qiov,
                                              BdrvRequestFlags flags)
 {
-    assert(flags == 0);
-    BDRVZonedState *s = bs->opaque;
-    int64_t zone_size_mask = s->header.zone_size - 1;
-    int64_t iov_len = 0;
-    int64_t len = 0;
-
-    if (*offset & zone_size_mask) {
-        error_report("sector offset %" PRId64 " is not aligned to zone size "
-                     "%" PRId32 "", *offset / 512, s->header.zone_size / 512);
-        return -EINVAL;
+    int ret = zoned_adjust_offset(bs, offset, qiov->size, true);
+    if (ret < 0) {
+        return ret;
     }
 
-    int64_t wg = bs->bl.write_granularity;
-    int64_t wg_mask = wg - 1;
-    for (int i = 0; i < qiov->niov; i++) {
-        iov_len = qiov->iov[i].iov_len;
-        if (iov_len & wg_mask) {
-            error_report("len of IOVector[%d] %" PRId64 " is not aligned to "
-                         "block size %" PRId64 "", i, iov_len, wg);
-            return -EINVAL;
-        }
-        len += iov_len;
-    }
-
-    return zoned_co_pwritev(bs, *offset, len, qiov, true);
+    return bdrv_co_zone_append(bs, offset, qiov, flags);
 }
 
 static void zoned_close(BlockDriverState *bs)
