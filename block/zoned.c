@@ -160,14 +160,27 @@ static int zoned_check_open(BlockDriverState *bs)
     }
 
     if(s->nr_zones_imp_open) {
-        if (zoned_check_active(bs) == 0) {
+        if ((zoned_check_active(bs) == 0) &&
+            (s->nr_zones_exp_open < s->header.max_open_zones)) {
             /* close all implicitly open zones */
+            int conv = s->header.nr_zones - s->header.zone_nr_seq;
+            for (int i = conv; i < s->header.nr_zones; ++i) {
+                if (ZONED_ZS(s->wps->wp[i]) == BLK_ZS_IOPEN) {
+                    int wp = ZONED_WP(s->wps->wp[i]);
+                    ZONED_SET_ZS(wp, (uint64_t)BLK_ZS_CLOSED);
+                    s->wps->wp[i] = wp;
+                }
+            }
+
         }
     }
 
     return -1;
 }
 
+/*
+ *
+ */
 static int zoned_check_zone_resources(BlockDriverState *bs,
                                       BlockZoneState zs)
 {
@@ -302,9 +315,18 @@ static coroutine_fn int zoned_co_pwritev(BlockDriverState *bs, int64_t offset,
     int index = offset / s->header.zone_size;
     BlockZoneState zs = ZONED_ZS(s->wps->wp[index]);
     uint64_t wp = ZONED_WP(s->wps->wp[index]);
-
     printf("zoned format: write\n");
+
+    /*
+     * Implicitly open one closed zone to write if there are zone resources
+     * left.
+     */
     if (zs == BLK_ZS_CLOSED || zs == BLK_ZS_EMPTY) {
+        ret = zoned_check_zone_resources(bs, zs);
+        if (ret < 0) {
+            return ret;
+        }
+
         if (zs == BLK_ZS_CLOSED) {
             s->nr_zones_closed--;
             s->nr_zones_imp_open++;
@@ -312,8 +334,7 @@ static coroutine_fn int zoned_co_pwritev(BlockDriverState *bs, int64_t offset,
             s->nr_zones_imp_open++;
         }
 
-        zs = BLK_ZS_IOPEN;
-        ZONED_SET_ZS(wp, (uint64_t)zs);
+        ZONED_SET_ZS(wp, (uint64_t)BLK_ZS_IOPEN);
         s->wps->wp[index] = wp;
     }
 
@@ -398,7 +419,6 @@ static int zoned_open_zone(BlockDriverState *bs, uint32_t index) {
 
     switch(zs) {
     case BLK_ZS_EMPTY:
-        printf("checking\n");
         ret = zoned_check_zone_resources(bs, BLK_ZS_EMPTY);
         if (ret < 0) {
             return ret;
@@ -545,6 +565,13 @@ static int zoned_reset_zone(BlockDriverState *bs, uint32_t index) {
     }
 
     wp = index * s->header.zone_size;
+    /* clear data */
+    ret = bdrv_pwrite_zeroes(bs->file, s->header_size + wp,
+                             s->header.zone_size, 0);
+    if (ret < 0) {
+        goto exit;
+    }
+
     ZONED_SET_ZS(wp, (uint64_t)BLK_ZS_EMPTY);
     s->wps->wp[index] = wp;
     ret = bdrv_pwrite(bs->file, s->header.size - s->meta_size
@@ -558,7 +585,7 @@ static int zoned_reset_zone(BlockDriverState *bs, uint32_t index) {
     }
     return 0;
 exit:
-    error_report("Failed to sync metadata with file");
+    error_report("Failed to reset zones");
     return ret;
 }
 
