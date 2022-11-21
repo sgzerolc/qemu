@@ -638,9 +638,11 @@ static bool check_zoned_request(VirtIOBlock *s, int64_t offset, int64_t len,
     }
 
     if (append) {
-        if ((offset % bs->bl.write_granularity) != 0) {
-            *status = VIRTIO_BLK_S_ZONE_UNALIGNED_WP;
-            return false;
+        if (bs->bl.write_granularity) {
+            if ((offset % bs->bl.write_granularity) != 0) {
+                *status = VIRTIO_BLK_S_ZONE_UNALIGNED_WP;
+                return false;
+            }
         }
 
         if (BDRV_ZT_IS_CONV(bs->bl.wps->wp[index])) {
