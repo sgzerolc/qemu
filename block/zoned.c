@@ -352,9 +352,6 @@ static coroutine_fn int zoned_co_pwritev(BlockDriverState *bs, int64_t offset,
             } else {
                 s->nr_zones_imp_open++;
             }
-
-            ZONED_SET_ZS(wp, (uint64_t) BLK_ZS_IOPEN);
-            s->wps->wp[index] = wp;
         }
 
         printf("zoned: wrote %ld at %ld\n", bytes, offset);
@@ -555,7 +552,7 @@ static int zoned_reset_zone(BlockDriverState *bs, uint32_t index) {
     /* clear state and type information */
     wp = ZONED_WP(s->wps->wp[index]);
     int ret;
-    printf("zoned format: reset zones at %x state\n", zs);
+    printf("zoned format: reset zones from %x state\n", zs);
 
     switch(zs) {
     case BLK_ZS_EMPTY:
@@ -641,6 +638,7 @@ static int coroutine_fn zoned_co_zone_mgmt(BlockDriverState *bs, BlockZoneOp op,
         break;
     case BLK_ZO_RESET:
         if (len == capacity) {
+            printf("reset all!\n");
             for (int i = s->header.nr_zones - s->header.zone_nr_seq;
                 i < s->header.nr_zones; ++i) {
                 ret = zoned_reset_zone(bs, i);
@@ -650,6 +648,7 @@ static int coroutine_fn zoned_co_zone_mgmt(BlockDriverState *bs, BlockZoneOp op,
             }
             return 0;
         } else {
+            printf("reset zone with offset 0x%lx\n", offset);
             ret = zoned_reset_zone(bs, index);
         }
         break;
