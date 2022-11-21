@@ -137,6 +137,8 @@ static int zoned_check_active(BlockDriverState *bs)
         return 0;
     }
 
+    printf("eo: %d, io: %d, cz: %d, maz: %d\n", s->nr_zones_exp_open, s->nr_zones_imp_open,
+           s->nr_zones_closed, s->header.max_active_zones);
     if (s->nr_zones_exp_open + s->nr_zones_imp_open + s->nr_zones_closed
         < s->header.max_active_zones) {
         return 0;
@@ -367,12 +369,16 @@ static int coroutine_fn zoned_co_zone_report(BlockDriverState *bs, int64_t offse
 
 static int zoned_open_zone(BlockDriverState *bs, uint32_t index) {
     BDRVZonedState *s = bs->opaque;
-    int ret;
-    uint64_t wp = ZONED_WP(s->wps->wp[index]);
+    uint64_t wp = s->wps->wp[index];
     BlockZoneState zs = ZONED_ZS(wp);
+    /* clear state and type information */
+    wp = ZONED_WP(s->wps->wp[index]);
+    int ret;
+    printf("zoned format: open zones at %x state\n", zs);
 
     switch(zs) {
     case BLK_ZS_EMPTY:
+        printf("checking\n");
         ret = zoned_check_zone_resources(bs, BLK_ZS_EMPTY);
         if (ret < 0) {
             return ret;
@@ -395,8 +401,9 @@ static int zoned_open_zone(BlockDriverState *bs, uint32_t index) {
     default:
         return -EINVAL;
     }
-
+    printf("before oz: %lx\n", wp);
     ZONED_SET_ZS(wp, (uint64_t)BLK_ZS_EOPEN);
+    printf("after oz: %lx\n", wp);
     s->nr_zones_exp_open++;
     s->wps->wp[index] = wp;
     ret = bdrv_pwrite(bs->file, s->header.size - s->meta_size
@@ -439,9 +446,12 @@ exit:
 
 static int zoned_finish_zone(BlockDriverState *bs, uint32_t index) {
     BDRVZonedState *s = bs->opaque;
-    int ret;
-    uint64_t wp = ZONED_WP(s->wps->wp[index]);
+    uint64_t wp = s->wps->wp[index];
     BlockZoneState zs = ZONED_ZS(wp);
+    /* clear state and type information */
+    wp = ZONED_WP(s->wps->wp[index]);
+    int ret;
+    printf("zoned format: close zones at %x state\n", zs);
 
     switch(zs) {
     case BLK_ZS_EMPTY:
@@ -489,9 +499,12 @@ exit:
 
 static int zoned_reset_zone(BlockDriverState *bs, uint32_t index) {
     BDRVZonedState *s = bs->opaque;
-    int ret;
-    uint64_t wp = ZONED_WP(s->wps->wp[index]);
+    uint64_t wp = s->wps->wp[index];
     BlockZoneState zs = ZONED_ZS(wp);
+    /* clear state and type information */
+    wp = ZONED_WP(s->wps->wp[index]);
+    int ret;
+    printf("zoned format: reset zones at %x state\n", zs);
 
     switch(zs) {
     case BLK_ZS_EMPTY:
