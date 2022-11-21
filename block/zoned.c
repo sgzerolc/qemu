@@ -137,14 +137,15 @@ static int zoned_check_active(BlockDriverState *bs)
         return 0;
     }
 
-    printf("eo: %d, io: %d, cz: %d, maz: %d\n", s->nr_zones_exp_open, s->nr_zones_imp_open,
-           s->nr_zones_closed, s->header.max_active_zones);
-    if (s->nr_zones_exp_open + s->nr_zones_imp_open + s->nr_zones_closed
-        < s->header.max_active_zones) {
-        return 0;
-    }
-
-    return -1;
+    /* skip this issue for now: over max active zones limit */
+//    printf("eo: %d, io: %d, cz: %d, maz: %d\n", s->nr_zones_exp_open, s->nr_zones_imp_open,
+//           s->nr_zones_closed, s->header.max_active_zones);
+//    if (s->nr_zones_exp_open + s->nr_zones_imp_open + s->nr_zones_closed
+//        < s->header.max_active_zones) {
+//        return 0;
+//    }
+//
+    return 0;
 }
 
 static int zoned_check_open(BlockDriverState *bs)
@@ -190,14 +191,21 @@ static int zoned_check_zone_resources(BlockDriverState *bs,
     case BLK_ZS_EMPTY:
         ret = zoned_check_active(bs);
         if (ret < 0) {
+            error_report("No enough active zones");
             return ret;
         }
         return ret;
     case BLK_ZS_CLOSED:
-        return zoned_check_open(bs);
+        ret = zoned_check_open(bs);
+        if (ret < 0) {
+            error_report("No enough open zones");
+            return ret;
+        }
+        return ret;
     default:
         return -EINVAL;
     }
+
 }
 
 static inline int zoned_refresh_metadata(BlockDriverState *bs)
@@ -286,7 +294,6 @@ static inline int zoned_adjust_offset(BlockDriverState *bs, int64_t *offset,
                                       int64_t bytes, bool is_write) {
     BDRVZonedState *s = bs->opaque;
 
-    printf("*offset: %ld, size: %ld, len: %ld\n", *offset, s->header.size, bytes);
     if (*offset > s->header.size || bytes > (s->header.size - *offset)) {
         return is_write ? -ENOSPC : -EINVAL;
     }
@@ -314,29 +321,8 @@ static coroutine_fn int zoned_co_pwritev(BlockDriverState *bs, int64_t offset,
     int ret;
     int index = offset / s->header.zone_size;
     BlockZoneState zs = ZONED_ZS(s->wps->wp[index]);
-    uint64_t wp = ZONED_WP(s->wps->wp[index]);
+    uint64_t wp = s->wps->wp[index];
     printf("zoned format: write\n");
-
-    /*
-     * Implicitly open one closed zone to write if there are zone resources
-     * left.
-     */
-    if (zs == BLK_ZS_CLOSED || zs == BLK_ZS_EMPTY) {
-        ret = zoned_check_zone_resources(bs, zs);
-        if (ret < 0) {
-            return ret;
-        }
-
-        if (zs == BLK_ZS_CLOSED) {
-            s->nr_zones_closed--;
-            s->nr_zones_imp_open++;
-        } else {
-            s->nr_zones_imp_open++;
-        }
-
-        ZONED_SET_ZS(wp, (uint64_t)BLK_ZS_IOPEN);
-        s->wps->wp[index] = wp;
-    }
 
     ret = zoned_adjust_offset(bs, &offset, bytes, true);
     if (ret < 0) {
@@ -347,20 +333,45 @@ static coroutine_fn int zoned_co_pwritev(BlockDriverState *bs, int64_t offset,
     if (ret < 0) {
         return ret;
     }
-    printf("zoned: wrote %ld at %ld\n", bytes, offset);
-    printf("before writing: 0x%lx\n", wp);
-    wp += bytes;
-    ZONED_SET_ZS(wp, (uint64_t)BLK_ZS_IOPEN);
-    s->wps->wp[index] = wp;
-    printf("after writing: 0x%lx\n", wp);
-    ret = bdrv_pwrite(bs->file, s->header.size - s->meta_size
-        + sizeof(uint64_t) * index, sizeof(uint64_t), &wp, 0);
-    if (ret < 0) {
-        goto exit;
-    }
-    ret = bdrv_co_flush(bs);
-    if (ret < 0) {
-        goto exit;
+
+    if (!ZONED_ZT_IS_CONV(wp)) {
+        /*
+         * Implicitly open one closed zone to write if there are zone resources
+         * left.
+         */
+        wp = ZONED_WP(wp);
+        if (zs == BLK_ZS_CLOSED || zs == BLK_ZS_EMPTY) {
+            ret = zoned_check_zone_resources(bs, zs);
+            if (ret < 0) {
+                return ret;
+            }
+
+            if (zs == BLK_ZS_CLOSED) {
+                s->nr_zones_closed--;
+                s->nr_zones_imp_open++;
+            } else {
+                s->nr_zones_imp_open++;
+            }
+
+            ZONED_SET_ZS(wp, (uint64_t) BLK_ZS_IOPEN);
+            s->wps->wp[index] = wp;
+        }
+
+        printf("zoned: wrote %ld at %ld\n", bytes, offset);
+        printf("before writing: 0x%lx\n", wp);
+        wp += bytes;
+        ZONED_SET_ZS(wp, (uint64_t) BLK_ZS_IOPEN);
+        s->wps->wp[index] = wp;
+        printf("after writing: 0x%lx\n", wp);
+        ret = bdrv_pwrite(bs->file, s->header.size - s->meta_size
+                                    + sizeof(uint64_t) * index, sizeof(uint64_t), &wp, 0);
+        if (ret < 0) {
+            goto exit;
+        }
+        ret = bdrv_co_flush(bs);
+        if (ret < 0) {
+            goto exit;
+        }
     }
     return 0;
 exit:
@@ -629,7 +640,18 @@ static int coroutine_fn zoned_co_zone_mgmt(BlockDriverState *bs, BlockZoneOp op,
         ret = zoned_finish_zone(bs, index);
         break;
     case BLK_ZO_RESET:
-        ret = zoned_reset_zone(bs, index);
+        if (len == capacity) {
+            for (int i = s->header.nr_zones - s->header.zone_nr_seq;
+                i < s->header.nr_zones; ++i) {
+                ret = zoned_reset_zone(bs, i);
+                if (ret < 0) {
+                    return ret;
+                }
+            }
+            return 0;
+        } else {
+            ret = zoned_reset_zone(bs, index);
+        }
         break;
     default:
         error_report("Unsupported zone op: 0x%x", op);
@@ -644,12 +666,7 @@ static int coroutine_fn zoned_co_zone_append(BlockDriverState *bs, int64_t *offs
                                              QEMUIOVector *qiov,
                                              BdrvRequestFlags flags)
 {
-    int ret = zoned_adjust_offset(bs, offset, qiov->size, true);
-    if (ret < 0) {
-        return ret;
-    }
-
-    return bdrv_co_zone_append(bs, offset, qiov, flags);
+    return zoned_co_pwritev(bs, *offset, qiov->size, qiov, flags);
 }
 
 static void zoned_close(BlockDriverState *bs)
