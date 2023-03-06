@@ -193,6 +193,159 @@ qcow2_extract_crypto_opts(QemuOpts *opts, const char *fmt, Error **errp)
     return cryptoopts_qdict;
 }
 
+#define QCOW2_ZT_IS_CONV(wp)    (wp & 1ULL << 59)
+
+static inline int qcow2_get_wp(uint64_t wp)
+{
+    /* clear state and type information */
+    return ((wp << 5) >> 5);
+}
+
+static inline int qcow2_get_zs(uint64_t wp)
+{
+    return (wp >> 60);
+}
+
+static inline void qcow2_set_wp(uint64_t *wp, BlockZoneState zs)
+{
+    uint64_t addr = qcow2_get_wp(*wp);
+    addr |= ((uint64_t)zs << 60);
+    *wp = addr;
+}
+
+/*
+ * Perform a state assignment and a flush operation that writes the new wp
+ * value to the dedicated location of the disk file.
+ */
+static int qcow2_flush_wp_at(BlockDriverState *bs, uint64_t *wp,
+                             uint32_t index, BlockZoneState zs) {
+    BDRVQcow2State *s = bs->opaque;
+    int ret;
+
+    qcow2_set_wp(wp, zs);
+    ret = bdrv_pwrite(bs->file, s->zoned_header.zonedmeta_offset
+        + sizeof(uint64_t) * index, sizeof(uint64_t), wp, 0);
+
+    if (ret < 0) {
+        goto exit;
+    }
+//    ret = bdrv_co_flush(bs);
+//    if (ret < 0) {
+//        goto exit;
+//    }
+    return 0;
+
+exit:
+    error_report("Failed to sync metadata with file");
+    return ret;
+}
+
+static int qcow2_check_active(BlockDriverState *bs)
+{
+    BDRVQcow2State *s = bs->opaque;
+
+    if (!s->zoned_header.max_active_zones) {
+        return 0;
+    }
+
+//    printf("eo: %d, io: %d, cz: %d, maz: %d\n", s->nr_zones_exp_open, s->nr_zones_imp_open,
+//           s->nr_zones_closed, s->zoned_header.max_active_zones);
+    if (s->nr_zones_exp_open + s->nr_zones_imp_open + s->nr_zones_closed
+        < s->zoned_header.max_active_zones) {
+        return 0;
+    }
+
+    return -1;
+}
+
+static int qcow2_check_open(BlockDriverState *bs)
+{
+    BDRVQcow2State *s = bs->opaque;
+    int ret;
+
+    if (!s->zoned_header.max_open_zones) {
+        return 0;
+    }
+
+    if (s->nr_zones_exp_open + s->nr_zones_imp_open
+        < s->zoned_header.max_open_zones) {
+        return 0;
+    }
+
+    if(s->nr_zones_imp_open) {
+        ret = qcow2_check_active(bs);
+        if (ret == 0) {
+            /* TODO: it takes O(n) time complexity (n = nr_zones). Optimizations required. */
+            /* close one implicitly open zones to make it available */
+            for (int i = s->zoned_header.zone_nr_conv; i < s->zoned_header.nr_zones; ++i) {
+                uint64_t *wp = &s->wps->wp[i];
+                if (qcow2_get_zs(*wp) == BLK_ZS_IOPEN) {
+                    ret = qcow2_flush_wp_at(bs, wp, i, BLK_ZS_CLOSED);
+                    if (ret < 0) {
+                        return ret;
+                    }
+                    s->wps->wp[i] = *wp;
+                    s->nr_zones_imp_open--;
+                    s->nr_zones_closed++;
+                    printf("after closing one imp_open zone:eo: %d, io: %d, cz: %d, maz: %d\n", s->nr_zones_exp_open, s->nr_zones_imp_open,
+                           s->nr_zones_closed, s->zoned_header.max_active_zones);
+                    break;
+                }
+            }
+            return 0;
+        }
+        return ret;
+    }
+
+    return -1;
+}
+
+/*
+ * The zoned device has limited zone resources of open, closed, active
+ * zones.
+ */
+static int qcow2_check_zone_resources(BlockDriverState *bs,
+                                      BlockZoneState zs)
+{
+    int ret;
+
+    switch (zs) {
+    case BLK_ZS_EMPTY:
+        ret = qcow2_check_active(bs);
+        if (ret < 0) {
+            error_report("No enough active zones");
+            return ret;
+        }
+        return ret;
+    case BLK_ZS_CLOSED:
+        ret = qcow2_check_open(bs);
+        if (ret < 0) {
+            error_report("No enough open zones");
+            return ret;
+        }
+        return ret;
+    default:
+        return -EINVAL;
+    }
+
+}
+
+static inline int qcow2_refresh_zonedmeta(BlockDriverState *bs)
+{
+    int ret;
+    BDRVQcow2State *s = bs->opaque;
+    uint64_t *temp = g_malloc(s->zoned_header.zonedmeta_size);
+    ret = bdrv_pread(bs->file, s->zoned_header.zonedmeta_offset,
+                     s->zoned_header.zonedmeta_size, temp, 0);
+    if (ret < 0) {
+        error_report("Can not read metadata\n");
+        return ret;
+    }
+
+    memcpy(s->wps->wp, temp, s->zoned_header.zonedmeta_size);
+    return 0;
+}
+
 /*
  * read qcow2 extension and fill bs
  * start reading from start_offset
@@ -438,7 +591,9 @@ qcow2_read_extensions(BlockDriverState *bs, uint64_t start_offset,
                 error_setg_errno(errp, -ret, "zoned_ext: "
                                              "Invalid extension length");
                 return -EINVAL;
-            }
+                    for (int j = 0; j < bs->bl.nr_zones; ++j) {
+            printf("wp[%d]: 0x%lx\n", j, bs->bl.wps->wp[j]);
+        }}
             ret = bdrv_pread(bs->file, offset, ext.len, &zoned_ext, 0);
             if (ret < 0) {
                 error_setg_errno(errp, -ret, "zoned_ext: "
@@ -447,14 +602,25 @@ qcow2_read_extensions(BlockDriverState *bs, uint64_t start_offset,
             }
 
             zoned_ext.zone_size = be32_to_cpu(zoned_ext.zone_size);
-            printf("read ext: zs %x, offset of zoned_ext: 0x%lx\n", zoned_ext.zone_size, offset);
+//            printf("read ext: zs %x, offset of zoned_ext: 0x%lx\n", zoned_ext.zone_size, offset);
             zoned_ext.nr_zones = be32_to_cpu(zoned_ext.nr_zones);
             zoned_ext.zone_nr_conv = be32_to_cpu(zoned_ext.zone_nr_conv);
             zoned_ext.zone_nr_seq = be32_to_cpu(zoned_ext.zone_nr_seq);
             zoned_ext.max_open_zones = be32_to_cpu(zoned_ext.max_open_zones);
             zoned_ext.max_active_zones = be32_to_cpu(zoned_ext.max_active_zones);
             zoned_ext.max_append_sectors = be32_to_cpu(zoned_ext.max_append_sectors);
+            zoned_ext.zonedmeta_offset = be64_to_cpu(zoned_ext.zonedmeta_offset);
+            zoned_ext.zonedmeta_size = be64_to_cpu(zoned_ext.zonedmeta_size);
             s->zoned_header = zoned_ext;
+            s->wps = g_malloc(sizeof(BlockZoneWps)
+                    + s->zoned_header.zonedmeta_size);
+            ret = qcow2_refresh_zonedmeta(bs);
+            if (ret < 0) {
+                error_setg_errno(errp, -ret, "zonedmeta: "
+                                             "Could not update zoned meta");
+                return ret;
+            }
+            qemu_co_mutex_init(&s->wps->colock);
 
 #ifdef DEBUG_EXT
             printf("Qcow2: Got zoned format extension: "
@@ -1974,6 +2140,14 @@ static void qcow2_refresh_limits(BlockDriverState *bs, Error **errp)
     }
     bs->bl.pwrite_zeroes_alignment = s->subcluster_size;
     bs->bl.pdiscard_alignment = s->cluster_size;
+    bs->bl.zoned = s->zoned_header.zoned;
+    bs->bl.nr_zones = s->zoned_header.nr_zones;
+    bs->wps = s->wps;
+    bs->bl.max_append_sectors = s->zoned_header.max_append_sectors;
+    bs->bl.max_active_zones = s->zoned_header.max_active_zones;
+    bs->bl.max_open_zones = s->zoned_header.max_open_zones;
+    bs->bl.zone_size = s->zoned_header.zone_size;
+    bs->bl.write_granularity = BDRV_SECTOR_SIZE;
 }
 
 static int qcow2_reopen_prepare(BDRVReopenState *state,
@@ -3108,7 +3282,9 @@ int qcow2_update_header(BlockDriverState *bs)
             .max_open_zones     = cpu_to_be32(s->zoned_header.max_open_zones),
             .max_active_zones   = cpu_to_be32(s->zoned_header.max_active_zones),
             .max_append_sectors =
-                cpu_to_be32(s->zoned_header.max_append_sectors)
+                cpu_to_be32(s->zoned_header.max_append_sectors),
+            .zonedmeta_offset   = cpu_to_be64(s->zoned_header.zonedmeta_offset),
+            .zonedmeta_size     = cpu_to_be64(s->zoned_header.zonedmeta_size)
         };
         printf("update header zs: %x\n", s->zoned_header.zone_size);
         memcpy(zoned_header.zm, s->zoned_header.zm, sizeof(s->zoned_header.zm));
@@ -3515,7 +3691,8 @@ qcow2_co_create(BlockdevCreateOptions *create_options, Error **errp)
     int version;
     int refcount_order;
     uint64_t *refcount_table;
-    int ret;
+    uint64_t zoned_meta_size, zoned_clusterlen;
+    int ret, offset, i;
     uint8_t compression_type = QCOW2_COMPRESSION_TYPE_ZLIB;
 
     assert(create_options->driver == BLOCKDEV_DRIVER_QCOW2);
@@ -3816,6 +3993,46 @@ qcow2_co_create(BlockdevCreateOptions *create_options, Error **errp)
         s->zoned_header.max_active_zones = qcow2_opts->max_active_zones;
         s->zoned_header.max_append_sectors = qcow2_opts->max_append_sectors;
         memcpy(s->zoned_header.zm, qcow2_opts->zm, sizeof(s->zoned_header.zm));
+
+        zoned_meta_size =  sizeof(uint64_t) * (s->zoned_header.zone_nr_seq
+                                       + s->zoned_header.zone_nr_conv);
+        uint64_t meta[zoned_meta_size];
+        memset(meta, 0, zoned_meta_size);
+
+        for (i = 0; i < s->zoned_header.zone_nr_conv; ++i) {
+            meta[i] = i * s->zoned_header.zone_size;
+            meta[i] += 1ULL << 59;
+        }
+        for (; i < s->zoned_header.nr_zones; ++i) {
+            meta[i] = i * s->zoned_header.zone_size;
+            /* For sequential zones, the first four most significant bit
+             * indicates zone states. */
+            meta[i] += ((uint64_t)BLK_ZS_EMPTY << 60);
+        }
+
+        offset = qcow2_alloc_clusters(blk_bs(blk), zoned_meta_size);
+        if (offset < 0) {
+            error_setg_errno(errp, -offset, "Could not allocate clusters for "
+                                         "zoned metadata size");
+            goto out;
+        }
+        s->zoned_header.zonedmeta_offset = offset;
+        s->zoned_header.zonedmeta_size = zoned_meta_size;
+
+        zoned_clusterlen = size_to_clusters(s, zoned_meta_size)
+                * s->cluster_size;
+        assert(qcow2_pre_write_overlap_check(bs, 0, offset, zoned_clusterlen,
+                                             false) == 0);
+        ret = bdrv_pwrite_zeroes(blk_bs(blk)->file, offset, zoned_clusterlen, 0);
+        if (ret < 0) {
+            error_setg_errno(errp, -ret, "Could not zero fill zoned metadata");
+            goto out;
+        }
+        ret = bdrv_pwrite(blk_bs(blk)->file, offset, zoned_meta_size, meta, 0);
+        if (ret < 0) {
+            error_setg_errno(errp, -ret, "Could not write zoned metadata to disk");
+            goto out;
+        }
     }
 
     /* Create a full header (including things like feature table) */
@@ -4157,53 +4374,360 @@ qcow2_co_zone_report(BlockDriverState *bs, int64_t offset,
                      unsigned int *nr_zones, BlockZoneDescriptor *zones)
 {
     BDRVQcow2State *s = bs->opaque;
-    uint64_t zs = s->zoned_header.zone_size;
-    printf("reporting cluster size: %d, zone size: %ld\n", s->cluster_size / 512, zs/512);
+    uint64_t zone_size = s->zoned_header.zone_size;
+    int64_t capacity = bs->total_sectors << BDRV_SECTOR_BITS;
+    int64_t size = bs->bl.nr_zones * zone_size;
+//    printf("reporting cluster size: %d, zone size: %ld\n", s->cluster_size / 512, zone_size/512);
+    int i = 0;
     int si;
-    if (zs > 0) {
-        si = offset / zs;
-        unsigned int nrz = *nr_zones;
-//        qemu_co_mutex_lock(&s->wps->colock);
-        for (int i = 0; i < nrz; ++i) {
-            zones[i].start = si * zs;
-            zones[i].length = zs;
-            zones[i].cap = zs;
 
-            uint64_t wp = s->wps->wp[si];
-//            if (ZONED_ZT_IS_CONV(wp)) {
-//                zones[i].type = BLK_ZT_CONV;
-//                zones[i].state = BLK_ZS_NOT_WP;
-//                /* Clear the zone type bit */
-//                wp &= ~(1ULL << 59);
-//            } else {
+    if (zone_size > 0) {
+        si = offset / zone_size;
+        unsigned int nrz = *nr_zones;
+//        for (int j = 0; j < bs->bl.nr_zones; ++j) {
+//            printf("wp[%d]: 0x%lx\n", j, bs->bl.wps->wp[j]);
+//        }
+//        qemu_co_mutex_lock(&s->wps->colock);
+        for (; i < nrz; ++i) {
+            zones[i].start = (si + i) * zone_size;
+
+            /* The last zone can be smaller than the zone size */
+            if ((si + i + 1) == bs->bl.nr_zones && size > capacity) {
+                zones[i].length = zone_size - (size - capacity);
+//                printf("zone_%d: 0x%lx\n", i, zones[i].length/512);
+            } else {
+                zones[i].length = zone_size;
+            }
+            zones[i].cap = zone_size;
+
+            uint64_t wp = s->wps->wp[si + i];
+            if (QCOW2_ZT_IS_CONV(wp)) {
+                zones[i].type = BLK_ZT_CONV;
+                zones[i].state = BLK_ZS_NOT_WP;
+                /* Clear the zone type bit */
+                wp &= ~(1ULL << 59);
+            } else {
                 zones[i].type = BLK_ZT_SWR;
-                zones[i].state = BLK_ZS_EMPTY;
-//                zones[i].state = zoned_get_zs(i, s->wps->wp);
+                zones[i].state = qcow2_get_zs(wp);
                 /* Clear the zone state bits */
-//                wp = zoned_get_wp(i, s->wps->wp);
-                wp = s->wps->wp[0];
-//            }
+                wp = qcow2_get_wp(wp);
+            }
 
             zones[i].wp = wp;
-            ++si;
+            if (si + i == s->zoned_header.nr_zones) {
+                break;
+            }
         }
+
 //        qemu_co_mutex_unlock(&s->wps->colock);
     }
+    *nr_zones = i;
+//    printf("i: %d\n", i);
     return 0;
 }
 
-static int coroutine_fn
-qcow2_co_zone_mgmt(BlockDriverState *bs, BlockZoneOp op, int64_t offset,
-                   int64_t len)
+static int qcow2_open_zone(BlockDriverState *bs, uint32_t index) {
+    BDRVQcow2State *s = bs->opaque;
+    uint64_t *wp = &s->wps->wp[index];
+    BlockZoneState zs = qcow2_get_zs(*wp);
+    int ret;
+
+    switch(zs) {
+    case BLK_ZS_EMPTY:
+        ret = qcow2_check_zone_resources(bs, BLK_ZS_EMPTY);
+        if (ret < 0) {
+            return ret;
+        }
+        break;
+    case BLK_ZS_IOPEN:
+        s->nr_zones_imp_open--;
+        break;
+    case BLK_ZS_EOPEN:
+        return 0;
+    case BLK_ZS_CLOSED:
+        ret = qcow2_check_zone_resources(bs, BLK_ZS_CLOSED);
+        if (ret < 0) {
+            return ret;
+        }
+        s->nr_zones_closed--;
+        break;
+    case BLK_ZS_FULL:
+        break;
+    default:
+        return -EINVAL;
+    }
+    ret = qcow2_flush_wp_at(bs, wp, index, BLK_ZS_EOPEN);
+    if (!ret) {
+        s->nr_zones_exp_open++;
+    }
+    return ret;
+}
+
+static int qcow2_close_zone(BlockDriverState *bs, uint32_t index) {
+    BDRVQcow2State *s = bs->opaque;
+    uint64_t *wp = &s->wps->wp[index];
+    BlockZoneState zs = qcow2_get_zs(*wp);
+    int ret;
+
+    switch(zs) {
+    case BLK_ZS_EMPTY:
+        break;
+    case BLK_ZS_IOPEN:
+        s->nr_zones_imp_open--;
+        break;
+    case BLK_ZS_EOPEN:
+        s->nr_zones_exp_open--;
+        break;
+    case BLK_ZS_CLOSED:
+        ret = qcow2_check_zone_resources(bs, BLK_ZS_CLOSED);
+        if (ret < 0) {
+            return ret;
+        }
+        s->nr_zones_closed--;
+        break;
+    case BLK_ZS_FULL:
+        break;
+    default:
+        return -EINVAL;
+    }
+
+    if (zs == BLK_ZS_EMPTY) {
+        ret = qcow2_flush_wp_at(bs, wp, index, BLK_ZS_EMPTY);
+    } else {
+        ret = qcow2_flush_wp_at(bs, wp, index, BLK_ZS_CLOSED);
+        if (!ret) {
+            s->nr_zones_closed++;
+        }
+    }
+    return ret;
+}
+
+static int qcow2_finish_zone(BlockDriverState *bs, uint32_t index) {
+    BDRVQcow2State *s = bs->opaque;
+    uint64_t *wp = &s->wps->wp[index];
+    BlockZoneState zs = qcow2_get_zs(*wp);
+    int ret;
+
+    switch(zs) {
+    case BLK_ZS_EMPTY:
+        ret = qcow2_check_zone_resources(bs, BLK_ZS_EMPTY);
+        if (ret < 0) {
+            return ret;
+        }
+        break;
+    case BLK_ZS_IOPEN:
+        s->nr_zones_imp_open--;
+        break;
+    case BLK_ZS_EOPEN:
+        s->nr_zones_exp_open--;
+        break;
+    case BLK_ZS_CLOSED:
+        ret = qcow2_check_zone_resources(bs, BLK_ZS_CLOSED);
+        if (ret < 0) {
+            return ret;
+        }
+        s->nr_zones_closed--;
+        break;
+    case BLK_ZS_FULL:
+        return 0;
+    default:
+        return -EINVAL;
+    }
+
+    *wp = (index + 1) * s->zoned_header.zone_size;
+    return qcow2_flush_wp_at(bs, wp, index, BLK_ZS_FULL);
+}
+
+static int qcow2_reset_zone(BlockDriverState *bs, uint32_t index,
+                            int64_t len) {
+    BDRVQcow2State *s = bs->opaque;
+    int nrz = bs->bl.nr_zones;
+    int zone_size = bs->bl.zone_size;
+    uint64_t *wp = &s->wps->wp[index];
+    int n, ret;
+//    printf("len 0x%lx\n", bs->total_sectors << BDRV_SECTOR_BITS);
+
+    if (len == bs->total_sectors << BDRV_SECTOR_BITS) {
+        n = nrz;
+        index = 0;
+    } else {
+        n = len / zone_size;
+    }
+    printf("n: %d\n", n);
+
+    for (int i = 0; i < n; ++i) {
+        uint64_t *wp_i = (uint64_t *)(wp + i);
+        if (QCOW2_ZT_IS_CONV(*wp_i)) {
+            continue;
+        }
+        
+        BlockZoneState zs = qcow2_get_zs(*wp_i);
+        switch (zs) {
+        case BLK_ZS_EMPTY:
+            break;
+        case BLK_ZS_IOPEN:
+            s->nr_zones_imp_open--;
+            break;
+        case BLK_ZS_EOPEN:
+            s->nr_zones_exp_open--;
+            break;
+        case BLK_ZS_CLOSED:
+            s->nr_zones_closed--;
+            break;
+        case BLK_ZS_FULL:
+            break;
+        default:
+            return -EINVAL;
+        }
+
+        if (zs == BLK_ZS_EMPTY) {
+            continue;
+        }
+
+        *wp_i = (index + i) * zone_size;
+        printf("[%d]: 0x%lx\n", i, *wp_i);
+        ret = qcow2_flush_wp_at(bs, wp_i, index + i, BLK_ZS_EMPTY);
+        if (ret < 0) {
+            return ret;
+        }
+        printf("reset all[%d]: offset 0x%lx\n", i, s->wps->wp[index+i]);
+    }
+
+    /* clear data */
+    ret = qcow2_co_pwrite_zeroes(bs, qcow2_get_wp(*wp), len, 0);
+    if (ret < 0) {
+        error_report("Failed to reset zone");
+        return ret;
+    }
+    return bdrv_co_flush(bs);
+}
+
+static int coroutine_fn qcow2_co_zone_mgmt(BlockDriverState *bs, BlockZoneOp op,
+                                           int64_t offset, int64_t len)
 {
-    return 0;
+    BDRVQcow2State *s = bs->opaque;
+    BlockZoneWps *wps = s->wps;
+    int ret = 0;
+    int64_t capacity = bs->total_sectors << BDRV_SECTOR_BITS;
+    int64_t zone_size = s->zoned_header.zone_size;
+    int64_t zone_size_mask = zone_size - 1;
+    uint64_t *wp = &wps->wp[offset / zone_size];
+
+    if (offset & zone_size_mask) {
+        printf("offset %ld\n", offset);
+        error_report("sector offset %" PRId64 " is not aligned to zone size"
+                     " %" PRId64 "", offset / 512, zone_size / 512);
+        return -EINVAL;
+    }
+
+    if (((offset + len) < capacity && len & zone_size_mask) ||
+        offset + len > capacity) {
+        error_report("number of sectors %" PRId64 " is not aligned to zone"
+                     " size %" PRId64 "", len / 512, zone_size / 512);
+        return -EINVAL;
+    }
+
+    qemu_co_mutex_lock(&wps->colock);
+    uint32_t index = offset / zone_size;
+    if (QCOW2_ZT_IS_CONV(*wp) && len != capacity) {
+        error_report("zone mgmt operations are not allowed for "
+                     "conventional zones");
+        ret = -EIO;
+        goto unlock;
+    }
+
+    switch(op) {
+    case BLK_ZO_OPEN:
+        ret = qcow2_open_zone(bs, index);
+        break;
+    case BLK_ZO_CLOSE:
+        ret = qcow2_close_zone(bs, index);
+        break;
+    case BLK_ZO_FINISH:
+        ret = qcow2_finish_zone(bs, index);
+        break;
+    case BLK_ZO_RESET:
+        ret = qcow2_reset_zone(bs, index, len);
+        break;
+    default:
+        error_report("Unsupported zone op: 0x%x", op);
+        ret = -ENOTSUP;
+        break;
+    }
+
+unlock:
+    qemu_co_mutex_unlock(&wps->colock);
+    return ret;
 }
 
 static int coroutine_fn
 qcow2_co_zone_append(BlockDriverState *bs, int64_t *offset, QEMUIOVector *qiov,
                      BdrvRequestFlags flags)
 {
-    return 0;
+    assert(flags == 0);
+    BDRVQcow2State *s = bs->opaque;
+    BlockZoneState zs;
+    int ret;
+
+    int64_t zone_size_mask = bs->bl.zone_size - 1;
+    int64_t iov_len = 0;
+    int64_t len = 0;
+    uint64_t *wp = &bs->bl.wps->wp[*offset / bs->bl.zone_size];
+    int index = *offset / bs->bl.zone_size;
+
+    if (*offset & zone_size_mask) {
+        error_report("sector offset %" PRId64 " is not aligned to zone size "
+                     "%" PRId32 "", *offset / 512, bs->bl.zone_size / 512);
+        return -EINVAL;
+    }
+
+    int64_t wg = bs->bl.write_granularity;
+    int64_t wg_mask = wg - 1;
+    for (int i = 0; i < qiov->niov; i++) {
+        iov_len = qiov->iov[i].iov_len;
+        if (iov_len & wg_mask) {
+            error_report("len of IOVector[%d] %" PRId64 " is not aligned to "
+                         "block size %" PRId64 "", i, iov_len, wg);
+            return -EINVAL;
+        }
+        len += iov_len;
+    }
+
+    uint64_t wp_i = qcow2_get_wp(*wp);
+    ret = qcow2_co_pwritev_part(bs, wp_i, len, qiov, 0, 0);
+    if (ret == 0) {
+        if (!QCOW2_ZT_IS_CONV(*wp)) {
+            /*
+             * Implicitly open one closed zone to write if there are zone resources
+             * left.
+             */
+            zs = qcow2_get_zs(*wp);
+            if (zs == BLK_ZS_CLOSED || zs == BLK_ZS_EMPTY) {
+                ret = qcow2_check_zone_resources(bs, zs);
+                if (ret < 0) {
+                    goto exit;
+                }
+
+                if (zs == BLK_ZS_CLOSED) {
+                    s->nr_zones_closed--;
+                    s->nr_zones_imp_open++;
+                } else {
+                    s->nr_zones_imp_open++;
+                }
+            }
+
+            *offset = wp_i;
+            if (*offset + len > wp_i) {
+                *wp = *offset + len;
+            }
+            ret = qcow2_flush_wp_at(bs, wp, index, BLK_ZS_IOPEN);
+        }
+    } else {
+        error_report("qcow2: zap failed");
+    }
+
+exit:
+    return ret;
 }
 
 static int coroutine_fn GRAPH_RDLOCK
