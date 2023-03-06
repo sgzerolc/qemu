@@ -4917,6 +4917,14 @@
 # @refcount-bits: Width of reference counts in bits (default: 16)
 # @compression-type: The image cluster compression method
 #                    (default: zlib, since 5.1)
+# @zm: Choose from zns and zbc
+# @zone-size: The size of a zone of the zoned device
+# @zone-nr-conv: The number of conventional zones of the zoned device
+# @zone-nr-seq: The number of sequential zones of the zoned device
+# @max-open-zones: The maximal allowed open zones
+# @max-active-zones: The limit of the zones that have the implicit open,
+#                    explicit open or closed state
+# @max-append-sectors: The maximal sectors that is allowed to append writes
 #
 # Since: 2.12
 ##
@@ -4934,7 +4942,14 @@
             '*preallocation':   'PreallocMode',
             '*lazy-refcounts':  'bool',
             '*refcount-bits':   'int',
-            '*compression-type':'Qcow2CompressionType' } }
+            '*compression-type':'Qcow2CompressionType',
+            'zm':               'str',
+            'zone-size':        'size',
+            'zone-nr-conv':     'int',
+            'zone-nr-seq':      'int',
+            'max-open-zones':   'int',
+            'max-active-zones': 'int',
+            'max-append-sectors':'int'}}
 
 ##
 # @BlockdevCreateOptionsQed:

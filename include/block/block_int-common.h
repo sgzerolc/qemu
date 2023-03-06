@@ -57,6 +57,7 @@
 #define BLOCK_OPT_DATA_FILE_RAW     "data_file_raw"
 #define BLOCK_OPT_COMPRESSION_TYPE  "compression_type"
 #define BLOCK_OPT_EXTL2             "extended_l2"
+#define BLOCK_OPT_Z_ZM              "zm"
 #define BLOCK_OPT_Z_TYPE            "zoned"
 #define BLOCK_OPT_Z_ZSIZE           "zone_size"
 #define BLOCK_OPT_Z_NR_COV          "zone_nr_conv"
