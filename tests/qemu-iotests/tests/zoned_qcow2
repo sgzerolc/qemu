@@ -25,8 +25,15 @@ echo "QA output created by $seq"
 
 IMG="--image-opts -n driver=qcow2,file.driver=file,file.filename=test.qcow2"
 QEMU_IO="build/qemu-io"
+
+zone_size=67108864
+size=768M
+zone_nr_conv=0
+zone_nr_seq=12
+nr_zone=$zone_nr_conv+$zone_nr_seq
+
 #QEMU_IO_OPTIONS=$QEMU_IO_OPTIONS_NO_FMT
-./build/qemu-img create -f qcow2 test.qcow2 -o size=768M -o zone_size=67108864 -o zone_nr_conv=0 -o zone_nr_seq=12 -o max_append_sectors=4 -o max_open_zones=4 -o max_active_zones=8 -o zm=zbd
+./build/qemu-img create -f qcow2 test.qcow2 -o size=$size -o zone_size=$zone_size -o zone_nr_conv=$zone_nr_conv -o zone_nr_seq=$zone_nr_seq -o max_append_sectors=512 -o max_open_zones=4 -o max_active_zones=8 -o zm=zbd
 
 #echo "case 1: if the operations work"
 #echo "(1) report the first zone:"
@@ -55,8 +62,6 @@ QEMU_IO="build/qemu-io"
 #$QEMU_IO $IMG -c "zrp 0x2c000000 1" # 0x20000000 / 512 = 0x160000
 #echo
 #echo
-zone_size=67108864
-nr_zone=12
 
 for ((i=0; i<$nr_zone; i++))
 do
@@ -85,20 +90,21 @@ done
 echo
 echo
 echo "(5) resetting the second zone"
-$QEMU_IO $IMG -c "zrs 0x4000000 67108864"
+$QEMU_IO $IMG -c "zrs 0x4000000 $zone_size"
 echo "report after:"
 $QEMU_IO $IMG -c "zrp 0x4000000 1"
 echo "resetting all"
-$QEMU_IO $IMG -c "zrs 0 805306368"
+$QEMU_IO $IMG -c "zrs 0 $size"
 echo "report after:"
 $QEMU_IO $IMG -c "zrp 0 12"
 #echo
 #echo
 echo "append write" # the physical block size of the device is 4096
-for ((i=0; i<$nr_zone; i++))
+for ((i=0; i<$((zone_size/262144)); i++))
 do
-  echo "zap zone[$i]"
-  $QEMU_IO $IMG -c "zap -p 0 0x1000 0x2000"  # 67108864 / 512 = 131072
+  echo "zap zone $i th"
+  $QEMU_IO $IMG -c "zap -p 0 0x20000 0x20000"  # 67108864 / 512 = 131072
+#  $QEMU_IO $IMG -c "zap -p $((i * zone_size)) 0x1000 0x2000"  # 67108864 / 512 = 131072
   echo "report after:"
   $QEMU_IO $IMG -c "zrp 0 1"
 done

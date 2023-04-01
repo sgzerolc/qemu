@@ -214,10 +214,20 @@ static inline void qcow2_set_wp(uint64_t *wp, BlockZoneState zs)
 }
 
 /*
+ * File wp tracking: reset zone, finish zone and append zone can
+ * change the value of write pointer. All zone operations will change
+ * the state of that/those zone.
+ * */
+static inline void qcow2_wp_tracking_helper(int index, uint64_t wp) {
+    /* format: operations, the wp. */
+    printf("wps[%d]: 0x%x\n", index, qcow2_get_wp(wp)>>BDRV_SECTOR_BITS);
+}
+
+/*
  * Perform a state assignment and a flush operation that writes the new wp
  * value to the dedicated location of the disk file.
  */
-static int qcow2_flush_wp_at(BlockDriverState *bs, uint64_t *wp,
+static int qcow2_write_wp_at(BlockDriverState *bs, uint64_t *wp,
                              uint32_t index, BlockZoneState zs) {
     BDRVQcow2State *s = bs->opaque;
     int ret;
@@ -229,14 +239,11 @@ static int qcow2_flush_wp_at(BlockDriverState *bs, uint64_t *wp,
     if (ret < 0) {
         goto exit;
     }
-//    ret = bdrv_co_flush(bs);
-//    if (ret < 0) {
-//        goto exit;
-//    }
-    return 0;
+    qcow2_wp_tracking_helper(index, *wp);
+    return ret;
 
 exit:
-    error_report("Failed to sync metadata with file");
+    error_report("Failed to write metadata with file");
     return ret;
 }
 
@@ -280,7 +287,7 @@ static int qcow2_check_open(BlockDriverState *bs)
             for (int i = s->zoned_header.zone_nr_conv; i < s->zoned_header.nr_zones; ++i) {
                 uint64_t *wp = &s->wps->wp[i];
                 if (qcow2_get_zs(*wp) == BLK_ZS_IOPEN) {
-                    ret = qcow2_flush_wp_at(bs, wp, i, BLK_ZS_CLOSED);
+                    ret = qcow2_write_wp_at(bs, wp, i, BLK_ZS_CLOSED);
                     if (ret < 0) {
                         return ret;
                     }
@@ -591,9 +598,7 @@ qcow2_read_extensions(BlockDriverState *bs, uint64_t start_offset,
                 error_setg_errno(errp, -ret, "zoned_ext: "
                                              "Invalid extension length");
                 return -EINVAL;
-                    for (int j = 0; j < bs->bl.nr_zones; ++j) {
-            printf("wp[%d]: 0x%lx\n", j, bs->bl.wps->wp[j]);
-        }}
+            }
             ret = bdrv_pread(bs->file, offset, ext.len, &zoned_ext, 0);
             if (ret < 0) {
                 error_setg_errno(errp, -ret, "zoned_ext: "
@@ -2839,9 +2844,26 @@ qcow2_co_pwritev_part(BlockDriverState *bs, int64_t offset, int64_t bytes,
     uint64_t host_offset;
     QCowL2Meta *l2meta = NULL;
     AioTaskPool *aio = NULL;
+    int64_t start_offset, start_bytes;
+    BlockZoneState zs;
+    int64_t end;
+    uint64_t *wp;
+    int64_t zone_size = bs->bl.zone_size;
+    int index;
 
     trace_qcow2_writev_start_req(qemu_coroutine_self(), offset, bytes);
 
+    start_offset = offset;
+    start_bytes = bytes;
+    /* The offset should not less than the wp of that
+     * zone where offset starts.  */
+    if (zone_size) {
+        index = start_offset / zone_size;
+        wp = &s->wps->wp[index];
+        if (offset < qcow2_get_wp(*wp)) {
+            return -EINVAL;
+        }
+    }
     while (bytes != 0 && aio_task_pool_status(aio) == 0) {
 
         l2meta = NULL;
@@ -2886,6 +2908,49 @@ qcow2_co_pwritev_part(BlockDriverState *bs, int64_t offset, int64_t bytes,
         offset += cur_bytes;
         qiov_offset += cur_bytes;
         trace_qcow2_writev_done_part(qemu_coroutine_self(), cur_bytes);
+    }
+
+    if (zone_size) {
+        index = start_offset / zone_size;
+        wp = &s->wps->wp[index];
+        uint64_t wpv = *wp;
+        if (!QCOW2_ZT_IS_CONV(wpv)) {
+            /*
+             * Implicitly open one closed zone to write if there are zone resources
+             * left.
+             */
+            zs = qcow2_get_zs(wpv);
+            if (zs == BLK_ZS_CLOSED || zs == BLK_ZS_EMPTY) {
+                ret = qcow2_check_zone_resources(bs, zs);
+                if (ret < 0) {
+                    goto fail_nometa;
+                }
+
+                if (zs == BLK_ZS_CLOSED) {
+                    s->nr_zones_closed--;
+                    s->nr_zones_imp_open++;
+                } else {
+                    s->nr_zones_imp_open++;
+                }
+            }
+
+            /* align up (start_offset, zone_size), the start offset is not
+             * necessarily power of two. */
+            end = ((start_offset + zone_size) / zone_size) * zone_size;
+            if (start_offset + start_bytes <= end) {
+                *wp = start_offset + start_bytes;
+            } else {
+                ret = -EINVAL;
+                printf("soff: 0x%lx, slen: 0x%lx, end: 0x%lx, zone size: 0x%lx\n",
+                       start_offset,start_bytes, end, zone_size);
+                goto fail_nometa;
+            }
+
+            ret = qcow2_write_wp_at(bs, wp, index,BLK_ZS_IOPEN);
+            if (ret < 0) {
+                goto fail_nometa;
+            }
+        }
     }
     ret = 0;
 
@@ -4387,7 +4452,8 @@ qcow2_co_zone_report(BlockDriverState *bs, int64_t offset,
 //        for (int j = 0; j < bs->bl.nr_zones; ++j) {
 //            printf("wp[%d]: 0x%lx\n", j, bs->bl.wps->wp[j]);
 //        }
-//        qemu_co_mutex_lock(&s->wps->colock);
+        printf("zrp: open wp lock\n");
+        qemu_co_mutex_lock(&s->wps->colock);
         for (; i < nrz; ++i) {
             zones[i].start = (si + i) * zone_size;
 
@@ -4419,7 +4485,8 @@ qcow2_co_zone_report(BlockDriverState *bs, int64_t offset,
             }
         }
 
-//        qemu_co_mutex_unlock(&s->wps->colock);
+        printf("zrp: close wp lock\n");
+        qemu_co_mutex_unlock(&s->wps->colock);
     }
     *nr_zones = i;
 //    printf("i: %d\n", i);
@@ -4428,9 +4495,11 @@ qcow2_co_zone_report(BlockDriverState *bs, int64_t offset,
 
 static int qcow2_open_zone(BlockDriverState *bs, uint32_t index) {
     BDRVQcow2State *s = bs->opaque;
+    int ret;
+
+    qemu_co_mutex_lock(&s->wps->colock);
     uint64_t *wp = &s->wps->wp[index];
     BlockZoneState zs = qcow2_get_zs(*wp);
-    int ret;
 
     switch(zs) {
     case BLK_ZS_EMPTY:
@@ -4456,18 +4525,21 @@ static int qcow2_open_zone(BlockDriverState *bs, uint32_t index) {
     default:
         return -EINVAL;
     }
-    ret = qcow2_flush_wp_at(bs, wp, index, BLK_ZS_EOPEN);
+    ret = qcow2_write_wp_at(bs, wp, index, BLK_ZS_EOPEN);
     if (!ret) {
         s->nr_zones_exp_open++;
     }
+    qemu_co_mutex_unlock(&s->wps->colock);
     return ret;
 }
 
 static int qcow2_close_zone(BlockDriverState *bs, uint32_t index) {
     BDRVQcow2State *s = bs->opaque;
+    int ret;
+
+    qemu_co_mutex_lock(&s->wps->colock);
     uint64_t *wp = &s->wps->wp[index];
     BlockZoneState zs = qcow2_get_zs(*wp);
-    int ret;
 
     switch(zs) {
     case BLK_ZS_EMPTY:
@@ -4492,21 +4564,24 @@ static int qcow2_close_zone(BlockDriverState *bs, uint32_t index) {
     }
 
     if (zs == BLK_ZS_EMPTY) {
-        ret = qcow2_flush_wp_at(bs, wp, index, BLK_ZS_EMPTY);
+        ret = qcow2_write_wp_at(bs, wp, index, BLK_ZS_EMPTY);
     } else {
-        ret = qcow2_flush_wp_at(bs, wp, index, BLK_ZS_CLOSED);
+        ret = qcow2_write_wp_at(bs, wp, index, BLK_ZS_CLOSED);
         if (!ret) {
             s->nr_zones_closed++;
         }
     }
+    qemu_co_mutex_unlock(&s->wps->colock);
     return ret;
 }
 
 static int qcow2_finish_zone(BlockDriverState *bs, uint32_t index) {
     BDRVQcow2State *s = bs->opaque;
+    int ret;
+
+    qemu_co_mutex_lock(&s->wps->colock);
     uint64_t *wp = &s->wps->wp[index];
     BlockZoneState zs = qcow2_get_zs(*wp);
-    int ret;
 
     switch(zs) {
     case BLK_ZS_EMPTY:
@@ -4535,7 +4610,9 @@ static int qcow2_finish_zone(BlockDriverState *bs, uint32_t index) {
     }
 
     *wp = (index + 1) * s->zoned_header.zone_size;
-    return qcow2_flush_wp_at(bs, wp, index, BLK_ZS_FULL);
+    ret = qcow2_write_wp_at(bs, wp, index, BLK_ZS_FULL);
+    qemu_co_mutex_unlock(&s->wps->colock);
+    return ret;
 }
 
 static int qcow2_reset_zone(BlockDriverState *bs, uint32_t index,
@@ -4543,10 +4620,11 @@ static int qcow2_reset_zone(BlockDriverState *bs, uint32_t index,
     BDRVQcow2State *s = bs->opaque;
     int nrz = bs->bl.nr_zones;
     int zone_size = bs->bl.zone_size;
-    uint64_t *wp = &s->wps->wp[index];
-    int n, ret;
-//    printf("len 0x%lx\n", bs->total_sectors << BDRV_SECTOR_BITS);
+    int n, ret = 0;
 
+    printf("zrs: open wp lock\n");
+    qemu_co_mutex_lock(&s->wps->colock);
+    uint64_t *wp = &s->wps->wp[index];
     if (len == bs->total_sectors << BDRV_SECTOR_BITS) {
         n = nrz;
         index = 0;
@@ -4557,11 +4635,12 @@ static int qcow2_reset_zone(BlockDriverState *bs, uint32_t index,
 
     for (int i = 0; i < n; ++i) {
         uint64_t *wp_i = (uint64_t *)(wp + i);
-        if (QCOW2_ZT_IS_CONV(*wp_i)) {
+        uint64_t wpi_v = *wp_i;
+        if (QCOW2_ZT_IS_CONV(wpi_v)) {
             continue;
         }
         
-        BlockZoneState zs = qcow2_get_zs(*wp_i);
+        BlockZoneState zs = qcow2_get_zs(wpi_v);
         switch (zs) {
         case BLK_ZS_EMPTY:
             break;
@@ -4586,32 +4665,32 @@ static int qcow2_reset_zone(BlockDriverState *bs, uint32_t index,
 
         *wp_i = (index + i) * zone_size;
         printf("[%d]: 0x%lx\n", i, *wp_i);
-        ret = qcow2_flush_wp_at(bs, wp_i, index + i, BLK_ZS_EMPTY);
+        ret = qcow2_write_wp_at(bs, wp_i, index + i, BLK_ZS_EMPTY);
+        printf("reset [%d]: offset 0x%lx\n", i, s->wps->wp[index+i]);
         if (ret < 0) {
             return ret;
         }
-        printf("reset all[%d]: offset 0x%lx\n", i, s->wps->wp[index+i]);
+        /* clear data */
+        ret = qcow2_co_pwrite_zeroes(bs, qcow2_get_wp(*wp_i), zone_size, 0);
+        if (ret < 0) {
+            error_report("Failed to reset zone at 0x%" PRIx64 "", *wp_i);
+        }
     }
-
-    /* clear data */
-    ret = qcow2_co_pwrite_zeroes(bs, qcow2_get_wp(*wp), len, 0);
-    if (ret < 0) {
-        error_report("Failed to reset zone");
-        return ret;
-    }
-    return bdrv_co_flush(bs);
+    printf("zrs: close wp lock\n");
+    qemu_co_mutex_unlock(&s->wps->colock);
+    return ret;
 }
 
 static int coroutine_fn qcow2_co_zone_mgmt(BlockDriverState *bs, BlockZoneOp op,
                                            int64_t offset, int64_t len)
 {
     BDRVQcow2State *s = bs->opaque;
-    BlockZoneWps *wps = s->wps;
     int ret = 0;
     int64_t capacity = bs->total_sectors << BDRV_SECTOR_BITS;
     int64_t zone_size = s->zoned_header.zone_size;
     int64_t zone_size_mask = zone_size - 1;
-    uint64_t *wp = &wps->wp[offset / zone_size];
+    uint32_t index = offset / zone_size;
+    BlockZoneWps *wps = s->wps;
 
     if (offset & zone_size_mask) {
         printf("offset %ld\n", offset);
@@ -4627,14 +4706,17 @@ static int coroutine_fn qcow2_co_zone_mgmt(BlockDriverState *bs, BlockZoneOp op,
         return -EINVAL;
     }
 
+    printf("zmgmt: open wp lock\n");
     qemu_co_mutex_lock(&wps->colock);
-    uint32_t index = offset / zone_size;
-    if (QCOW2_ZT_IS_CONV(*wp) && len != capacity) {
+    uint64_t wpv = wps->wp[offset / zone_size];
+    if (QCOW2_ZT_IS_CONV(wpv) && len != capacity) {
         error_report("zone mgmt operations are not allowed for "
                      "conventional zones");
         ret = -EIO;
         goto unlock;
     }
+    printf("zmgmt: close wp lock\n");
+    qemu_co_mutex_unlock(&wps->colock);
 
     switch(op) {
     case BLK_ZO_OPEN:
@@ -4654,8 +4736,10 @@ static int coroutine_fn qcow2_co_zone_mgmt(BlockDriverState *bs, BlockZoneOp op,
         ret = -ENOTSUP;
         break;
     }
+    return ret;
 
 unlock:
+    printf("zmgmt: cl\n");
     qemu_co_mutex_unlock(&wps->colock);
     return ret;
 }
@@ -4666,15 +4750,13 @@ qcow2_co_zone_append(BlockDriverState *bs, int64_t *offset, QEMUIOVector *qiov,
 {
     assert(flags == 0);
     BDRVQcow2State *s = bs->opaque;
-    BlockZoneState zs;
     int ret;
-
     int64_t zone_size_mask = bs->bl.zone_size - 1;
     int64_t iov_len = 0;
     int64_t len = 0;
-    uint64_t *wp = &bs->bl.wps->wp[*offset / bs->bl.zone_size];
-    int index = *offset / bs->bl.zone_size;
+//    int index = *offset / bs->bl.zone_size;
 
+    /* offset + len should not pass the end of that zone starting from offset */
     if (*offset & zone_size_mask) {
         error_report("sector offset %" PRId64 " is not aligned to zone size "
                      "%" PRId32 "", *offset / 512, bs->bl.zone_size / 512);
@@ -4690,43 +4772,26 @@ qcow2_co_zone_append(BlockDriverState *bs, int64_t *offset, QEMUIOVector *qiov,
                          "block size %" PRId64 "", i, iov_len, wg);
             return -EINVAL;
         }
-        len += iov_len;
+    }
+    len = qiov->size;
+
+    if ((len >> BDRV_SECTOR_BITS) > bs->bl.max_append_sectors) {
+        return -ENOTSUP;
     }
 
-    uint64_t wp_i = qcow2_get_wp(*wp);
+    printf("zap: open lock\n");
+    qemu_co_mutex_lock(&s->wps->colock);
+    uint64_t wp = s->wps->wp[*offset / bs->bl.zone_size];
+    uint64_t wp_i = qcow2_get_wp(wp);
     ret = qcow2_co_pwritev_part(bs, wp_i, len, qiov, 0, 0);
     if (ret == 0) {
-        if (!QCOW2_ZT_IS_CONV(*wp)) {
-            /*
-             * Implicitly open one closed zone to write if there are zone resources
-             * left.
-             */
-            zs = qcow2_get_zs(*wp);
-            if (zs == BLK_ZS_CLOSED || zs == BLK_ZS_EMPTY) {
-                ret = qcow2_check_zone_resources(bs, zs);
-                if (ret < 0) {
-                    goto exit;
-                }
-
-                if (zs == BLK_ZS_CLOSED) {
-                    s->nr_zones_closed--;
-                    s->nr_zones_imp_open++;
-                } else {
-                    s->nr_zones_imp_open++;
-                }
-            }
-
-            *offset = wp_i;
-            if (*offset + len > wp_i) {
-                *wp = *offset + len;
-            }
-            ret = qcow2_flush_wp_at(bs, wp, index, BLK_ZS_IOPEN);
-        }
+        *offset = wp_i;
     } else {
         error_report("qcow2: zap failed");
     }
 
-exit:
+    printf("zap: cl\n");
+    qemu_co_mutex_unlock(&s->wps->colock);
     return ret;
 }
 
