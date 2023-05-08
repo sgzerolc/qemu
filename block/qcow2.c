@@ -2172,6 +2172,8 @@ static void qcow2_refresh_limits(BlockDriverState *bs, Error **errp)
     bs->bl.pwrite_zeroes_alignment = s->subcluster_size;
     bs->bl.pdiscard_alignment = s->cluster_size;
     bs->bl.zoned = s->zoned_header.zoned;
+    bs->bl.zoned_profile = s->zoned_header.zoned_profile;
+    bs->bl.zone_capacity = s->zoned_header.zone_capacity;
     bs->bl.nr_zones = s->zoned_header.nr_zones;
     bs->wps = s->wps;
     bs->bl.max_append_sectors = s->zoned_header.max_append_sectors;
@@ -4083,8 +4085,22 @@ qcow2_co_create(BlockdevCreateOptions *create_options, Error **errp)
         s->zoned_header.zoned = BLK_Z_HM;
         s->zoned_header.zone_size = qcow2_opts->zone_size;
         s->zoned_header.zone_nr_conv = qcow2_opts->zone_nr_conv;
-        s->zoned_header.max_open_zones = qcow2_opts->max_open_zones;
-        s->zoned_header.max_active_zones = qcow2_opts->max_active_zones;
+
+        if (!qcow2_opts->max_active_zones) {
+            if (qcow2_opts->max_open_zones > qcow2_opts->max_active_zones) {
+                error_setg(errp, "max_open_zones (%u) exceeds "
+                           "max_active_zones (%u)", qcow2_opts->max_open_zones,
+                           qcow2_opts->max_active_zones);
+                return -1;
+            }
+
+            if (!qcow2_opts->max_open_zones) {
+                s->zoned_header.max_open_zones = qcow2_opts->max_active_zones;
+            }
+            s->zoned_header.max_open_zones = qcow2_opts->max_open_zones;
+            s->zoned_header.max_active_zones = qcow2_opts->max_active_zones;
+        }
+
         s->zoned_header.max_append_sectors = qcow2_opts->max_append_sectors;
         s->zoned_header.nr_zones = qcow2_opts->size / qcow2_opts->zone_size;
 
