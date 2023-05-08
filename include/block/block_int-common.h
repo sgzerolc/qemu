@@ -880,11 +880,15 @@ typedef struct BlockLimits {
      */
     bool has_variable_length;
 
+    BlockZonedProfile zoned_profile;
+
     /* device zone model */
     BlockZoneModel zoned;
 
     /* zone size expressed in bytes */
     uint32_t zone_size;
+
+    uint32_t zone_capacity;
 
     /* total number of zones */
     uint32_t nr_zones;

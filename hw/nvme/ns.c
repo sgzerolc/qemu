@@ -25,7 +25,6 @@
 #include "trace.h"
 
 #define MIN_DISCARD_GRANULARITY (4 * KiB)
-#define NVME_DEFAULT_ZONE_SIZE   (128 * MiB)
 
 void nvme_ns_init_format(NvmeNamespace *ns)
 {
@@ -177,16 +176,18 @@ static int nvme_ns_init_blk(NvmeNamespace *ns, Error **errp)
 
 static int nvme_ns_zoned_check_calc_geometry(NvmeNamespace *ns, Error **errp)
 {
+    BlockDriverState *bs = blk_bs(ns->blkconf.blk);
     uint64_t zone_size, zone_cap;
 
     /* Make sure that the values of ZNS properties are sane */
-    if (ns->params.zone_size_bs) {
-        zone_size = ns->params.zone_size_bs;
+    if (bs->bl.zone_size) {
+        zone_size = bs->bl.zone_size;
     } else {
-        zone_size = NVME_DEFAULT_ZONE_SIZE;
+        return -1;
     }
-    if (ns->params.zone_cap_bs) {
-        zone_cap = ns->params.zone_cap_bs;
+
+    if (bs->bl.zone_capacity) {
+        zone_cap = bs->bl.zone_capacity;
     } else {
         zone_cap = zone_size;
     }
@@ -266,6 +267,7 @@ static void nvme_ns_zoned_init_state(NvmeNamespace *ns)
 
 static void nvme_ns_init_zoned(NvmeNamespace *ns)
 {
+    BlockDriverState *bs = blk_bs(ns->blkconf.blk);
     NvmeIdNsZoned *id_ns_z;
     int i;
 
@@ -274,8 +276,8 @@ static void nvme_ns_init_zoned(NvmeNamespace *ns)
     id_ns_z = g_new0(NvmeIdNsZoned, 1);
 
     /* MAR/MOR are zeroes-based, FFFFFFFFFh means no limit */
-    id_ns_z->mar = cpu_to_le32(ns->params.max_active_zones - 1);
-    id_ns_z->mor = cpu_to_le32(ns->params.max_open_zones - 1);
+    id_ns_z->mar = cpu_to_le32(bs->bl.max_active_zones - 1);
+    id_ns_z->mor = cpu_to_le32(bs->bl.max_open_zones - 1);
     id_ns_z->zoc = 0;
     id_ns_z->ozcs = ns->params.cross_zone_read ?
         NVME_ID_NS_ZONED_OZCS_RAZB : 0x00;
@@ -329,6 +331,7 @@ static void nvme_ns_init_zoned(NvmeNamespace *ns)
 
 static void nvme_clear_zone(NvmeNamespace *ns, NvmeZone *zone)
 {
+    BlockDriverState *bs = blk_bs(ns->blkconf.blk);
     uint8_t state;
 
     zone->w_ptr = zone->d.wp;
@@ -339,7 +342,7 @@ static void nvme_clear_zone(NvmeNamespace *ns, NvmeZone *zone)
             trace_pci_nvme_clear_ns_close(state, zone->d.zslba);
             nvme_set_zone_state(zone, NVME_ZONE_STATE_CLOSED);
         }
-        nvme_aor_inc_active(ns);
+        nvme_aor_inc_active(ns, bs);
         QTAILQ_INSERT_HEAD(&ns->closed_zones, zone, entry);
     } else {
         trace_pci_nvme_clear_ns_reset(state, zone->d.zslba);
@@ -356,23 +359,24 @@ static void nvme_clear_zone(NvmeNamespace *ns, NvmeZone *zone)
  */
 static void nvme_zoned_ns_shutdown(NvmeNamespace *ns)
 {
+    BlockDriverState *bs = blk_bs(ns->blkconf.blk);
     NvmeZone *zone, *next;
 
     QTAILQ_FOREACH_SAFE(zone, &ns->closed_zones, entry, next) {
         QTAILQ_REMOVE(&ns->closed_zones, zone, entry);
-        nvme_aor_dec_active(ns);
+        nvme_aor_dec_active(ns, bs);
         nvme_clear_zone(ns, zone);
     }
     QTAILQ_FOREACH_SAFE(zone, &ns->imp_open_zones, entry, next) {
         QTAILQ_REMOVE(&ns->imp_open_zones, zone, entry);
-        nvme_aor_dec_open(ns);
-        nvme_aor_dec_active(ns);
+        nvme_aor_dec_open(ns, bs);
+        nvme_aor_dec_active(ns, bs);
         nvme_clear_zone(ns, zone);
     }
     QTAILQ_FOREACH_SAFE(zone, &ns->exp_open_zones, entry, next) {
         QTAILQ_REMOVE(&ns->exp_open_zones, zone, entry);
-        nvme_aor_dec_open(ns);
-        nvme_aor_dec_active(ns);
+        nvme_aor_dec_open(ns, bs);
+        nvme_aor_dec_active(ns, bs);
         nvme_clear_zone(ns, zone);
     }
 
@@ -539,6 +543,7 @@ static bool nvme_ns_init_fdp(NvmeNamespace *ns, Error **errp)
 
 static int nvme_ns_check_constraints(NvmeNamespace *ns, Error **errp)
 {
+    BlockDriverState *bs = blk_bs(ns->blkconf.blk);
     unsigned int pi_size;
 
     if (!ns->blkconf.blk) {
@@ -577,22 +582,23 @@ static int nvme_ns_check_constraints(NvmeNamespace *ns, Error **errp)
         return -1;
     }
 
-    if (ns->params.zoned && ns->endgrp && ns->endgrp->fdp.enabled) {
+    if (bs->bl.zoned_profile == BLK_ZP_ZNS && ns->endgrp
+    && ns->endgrp->fdp.enabled) {
         error_setg(errp, "cannot be a zoned- in an FDP configuration");
         return -1;
     }
 
-    if (ns->params.zoned) {
-        if (ns->params.max_active_zones) {
-            if (ns->params.max_open_zones > ns->params.max_active_zones) {
+    if (bs->bl.zoned_profile == BLK_ZP_ZNS) {
+        if (bs->bl.max_active_zones) {
+            if (bs->bl.max_open_zones > bs->bl.max_active_zones) {
                 error_setg(errp, "max_open_zones (%u) exceeds "
-                           "max_active_zones (%u)", ns->params.max_open_zones,
-                           ns->params.max_active_zones);
+                           "max_active_zones (%u)", bs->bl.max_open_zones,
+                           bs->bl.max_active_zones);
                 return -1;
             }
 
-            if (!ns->params.max_open_zones) {
-                ns->params.max_open_zones = ns->params.max_active_zones;
+            if (!bs->bl.max_open_zones) {
+                bs->bl.max_open_zones = bs->bl.max_active_zones;
             }
         }
 
@@ -630,14 +636,14 @@ static int nvme_ns_check_constraints(NvmeNamespace *ns, Error **errp)
                 return -1;
             }
 
-            if (ns->params.max_active_zones) {
-                if (ns->params.numzrwa > ns->params.max_active_zones) {
+            if (bs->bl.max_active_zones) {
+                if (ns->params.numzrwa > bs->bl.max_active_zones) {
                     error_setg(errp, "number of zone random write area "
                                "resources (zoned.numzrwa, %d) must be less "
                                "than or equal to maximum active resources "
                                "(zoned.max_active_zones, %d)",
                                ns->params.numzrwa,
-                               ns->params.max_active_zones);
+                               bs->bl.max_active_zones);
                     return -1;
                 }
             }
@@ -649,6 +655,7 @@ static int nvme_ns_check_constraints(NvmeNamespace *ns, Error **errp)
 
 int nvme_ns_setup(NvmeNamespace *ns, Error **errp)
 {
+    BlockDriverState *bs = blk_bs(ns->blkconf.blk);
     if (nvme_ns_check_constraints(ns, errp)) {
         return -1;
     }
@@ -660,7 +667,7 @@ int nvme_ns_setup(NvmeNamespace *ns, Error **errp)
     if (nvme_ns_init(ns, errp)) {
         return -1;
     }
-    if (ns->params.zoned) {
+    if (bs->bl.zoned_profile == BLK_ZP_ZNS) {
         if (nvme_ns_zoned_check_calc_geometry(ns, errp) != 0) {
             return -1;
         }
@@ -683,15 +690,17 @@ void nvme_ns_drain(NvmeNamespace *ns)
 
 void nvme_ns_shutdown(NvmeNamespace *ns)
 {
+    BlockDriverState *bs = blk_bs(ns->blkconf.blk);
     blk_flush(ns->blkconf.blk);
-    if (ns->params.zoned) {
+    if (bs->bl.zoned_profile == BLK_ZP_ZNS) {
         nvme_zoned_ns_shutdown(ns);
     }
 }
 
 void nvme_ns_cleanup(NvmeNamespace *ns)
 {
-    if (ns->params.zoned) {
+    BlockDriverState *bs = blk_bs(ns->blkconf.blk);
+    if (bs->bl.zoned_profile == BLK_ZP_ZNS) {
         g_free(ns->id_ns_zoned);
         g_free(ns->zone_array);
         g_free(ns->zd_extensions);
@@ -806,17 +815,8 @@ static Property nvme_ns_props[] = {
     DEFINE_PROP_UINT16("mssrl", NvmeNamespace, params.mssrl, 128),
     DEFINE_PROP_UINT32("mcl", NvmeNamespace, params.mcl, 128),
     DEFINE_PROP_UINT8("msrc", NvmeNamespace, params.msrc, 127),
-    DEFINE_PROP_BOOL("zoned", NvmeNamespace, params.zoned, false),
-    DEFINE_PROP_SIZE("zoned.zone_size", NvmeNamespace, params.zone_size_bs,
-                     NVME_DEFAULT_ZONE_SIZE),
-    DEFINE_PROP_SIZE("zoned.zone_capacity", NvmeNamespace, params.zone_cap_bs,
-                     0),
     DEFINE_PROP_BOOL("zoned.cross_read", NvmeNamespace,
                      params.cross_zone_read, false),
-    DEFINE_PROP_UINT32("zoned.max_active", NvmeNamespace,
-                       params.max_active_zones, 0),
-    DEFINE_PROP_UINT32("zoned.max_open", NvmeNamespace,
-                       params.max_open_zones, 0),
     DEFINE_PROP_UINT32("zoned.descr_ext_size", NvmeNamespace,
                        params.zd_extension_size, 0),
     DEFINE_PROP_UINT32("zoned.numzrwa", NvmeNamespace, params.numzrwa, 0),
