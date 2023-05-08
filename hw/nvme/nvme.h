@@ -23,6 +23,7 @@
 #include "hw/block/block.h"
 
 #include "block/nvme.h"
+#include "block/block_int-common.h"
 
 #define NVME_MAX_CONTROLLERS 256
 #define NVME_MAX_NAMESPACES  256
@@ -182,12 +183,7 @@ typedef struct NvmeNamespaceParams {
     uint32_t mcl;
     uint8_t  msrc;
 
-    bool     zoned;
     bool     cross_zone_read;
-    uint64_t zone_size_bs;
-    uint64_t zone_cap_bs;
-    uint32_t max_active_zones;
-    uint32_t max_open_zones;
     uint32_t zd_extension_size;
 
     uint32_t numzrwa;
@@ -317,36 +313,40 @@ static inline uint8_t *nvme_get_zd_extension(NvmeNamespace *ns,
     return &ns->zd_extensions[zone_idx * ns->params.zd_extension_size];
 }
 
-static inline void nvme_aor_inc_open(NvmeNamespace *ns)
+static inline void nvme_aor_inc_open(NvmeNamespace *ns,
+                                     BlockDriverState *bs)
 {
     assert(ns->nr_open_zones >= 0);
-    if (ns->params.max_open_zones) {
+    if (bs->bl.max_open_zones) {
         ns->nr_open_zones++;
-        assert(ns->nr_open_zones <= ns->params.max_open_zones);
+        assert(ns->nr_open_zones <= bs->bl.max_open_zones);
     }
 }
 
-static inline void nvme_aor_dec_open(NvmeNamespace *ns)
+static inline void nvme_aor_dec_open(NvmeNamespace *ns,
+                                     BlockDriverState *bs)
 {
-    if (ns->params.max_open_zones) {
+    if (bs->bl.max_open_zones) {
         assert(ns->nr_open_zones > 0);
         ns->nr_open_zones--;
     }
     assert(ns->nr_open_zones >= 0);
 }
 
-static inline void nvme_aor_inc_active(NvmeNamespace *ns)
+static inline void nvme_aor_inc_active(NvmeNamespace *ns,
+                                       BlockDriverState *bs)
 {
     assert(ns->nr_active_zones >= 0);
-    if (ns->params.max_active_zones) {
+    if (bs->bl.max_active_zones) {
         ns->nr_active_zones++;
-        assert(ns->nr_active_zones <= ns->params.max_active_zones);
+        assert(ns->nr_active_zones <= bs->bl.max_active_zones);
     }
 }
 
-static inline void nvme_aor_dec_active(NvmeNamespace *ns)
+static inline void nvme_aor_dec_active(NvmeNamespace *ns,
+                                       BlockDriverState *bs)
 {
-    if (ns->params.max_active_zones) {
+    if (bs->bl.max_active_zones) {
         assert(ns->nr_active_zones > 0);
         ns->nr_active_zones--;
         assert(ns->nr_active_zones >= ns->nr_open_zones);

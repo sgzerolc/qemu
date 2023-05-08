@@ -410,15 +410,16 @@ static void nvme_assign_zone_state(NvmeNamespace *ns, NvmeZone *zone,
 static uint16_t nvme_zns_check_resources(NvmeNamespace *ns, uint32_t act,
                                          uint32_t opn, uint32_t zrwa)
 {
-    if (ns->params.max_active_zones != 0 &&
-        ns->nr_active_zones + act > ns->params.max_active_zones) {
-        trace_pci_nvme_err_insuff_active_res(ns->params.max_active_zones);
+    BlockDriverState *bs = blk_bs(ns->blkconf.blk);
+    if (bs->bl.max_active_zones != 0 &&
+        ns->nr_active_zones + act > bs->bl.max_active_zones) {
+        trace_pci_nvme_err_insuff_active_res(bs->bl.max_active_zones);
         return NVME_ZONE_TOO_MANY_ACTIVE | NVME_DNR;
     }
 
-    if (ns->params.max_open_zones != 0 &&
-        ns->nr_open_zones + opn > ns->params.max_open_zones) {
-        trace_pci_nvme_err_insuff_open_res(ns->params.max_open_zones);
+    if (bs->bl.max_open_zones != 0 &&
+        ns->nr_open_zones + opn > bs->bl.max_open_zones) {
+        trace_pci_nvme_err_insuff_open_res(bs->bl.max_open_zones);
         return NVME_ZONE_TOO_MANY_OPEN | NVME_DNR;
     }
 
@@ -1907,16 +1908,17 @@ static uint16_t nvme_check_zone_read(NvmeNamespace *ns, uint64_t slba,
 
 static uint16_t nvme_zrm_finish(NvmeNamespace *ns, NvmeZone *zone)
 {
+    BlockDriverState *bs = blk_bs(ns->blkconf.blk);
     switch (nvme_get_zone_state(zone)) {
     case NVME_ZONE_STATE_FULL:
         return NVME_SUCCESS;
 
     case NVME_ZONE_STATE_IMPLICITLY_OPEN:
     case NVME_ZONE_STATE_EXPLICITLY_OPEN:
-        nvme_aor_dec_open(ns);
+        nvme_aor_dec_open(ns, bs);
         /* fallthrough */
     case NVME_ZONE_STATE_CLOSED:
-        nvme_aor_dec_active(ns);
+        nvme_aor_dec_active(ns, bs);
 
         if (zone->d.za & NVME_ZA_ZRWA_VALID) {
             zone->d.za &= ~NVME_ZA_ZRWA_VALID;
@@ -1937,10 +1939,11 @@ static uint16_t nvme_zrm_finish(NvmeNamespace *ns, NvmeZone *zone)
 
 static uint16_t nvme_zrm_close(NvmeNamespace *ns, NvmeZone *zone)
 {
+    BlockDriverState *bs = blk_bs(ns->blkconf.blk);
     switch (nvme_get_zone_state(zone)) {
     case NVME_ZONE_STATE_EXPLICITLY_OPEN:
     case NVME_ZONE_STATE_IMPLICITLY_OPEN:
-        nvme_aor_dec_open(ns);
+        nvme_aor_dec_open(ns, bs);
         nvme_assign_zone_state(ns, zone, NVME_ZONE_STATE_CLOSED);
         /* fall through */
     case NVME_ZONE_STATE_CLOSED:
@@ -1953,13 +1956,14 @@ static uint16_t nvme_zrm_close(NvmeNamespace *ns, NvmeZone *zone)
 
 static uint16_t nvme_zrm_reset(NvmeNamespace *ns, NvmeZone *zone)
 {
+    BlockDriverState *bs = blk_bs(ns->blkconf.blk);
     switch (nvme_get_zone_state(zone)) {
     case NVME_ZONE_STATE_EXPLICITLY_OPEN:
     case NVME_ZONE_STATE_IMPLICITLY_OPEN:
-        nvme_aor_dec_open(ns);
+        nvme_aor_dec_open(ns, bs);
         /* fallthrough */
     case NVME_ZONE_STATE_CLOSED:
-        nvme_aor_dec_active(ns);
+        nvme_aor_dec_active(ns, bs);
 
         if (zone->d.za & NVME_ZA_ZRWA_VALID) {
             if (ns->params.numzrwa) {
@@ -1983,10 +1987,11 @@ static uint16_t nvme_zrm_reset(NvmeNamespace *ns, NvmeZone *zone)
 
 static void nvme_zrm_auto_transition_zone(NvmeNamespace *ns)
 {
+    BlockDriverState *bs = blk_bs(ns->blkconf.blk);
     NvmeZone *zone;
 
-    if (ns->params.max_open_zones &&
-        ns->nr_open_zones == ns->params.max_open_zones) {
+    if (bs->bl.max_open_zones &&
+        ns->nr_open_zones == bs->bl.max_open_zones) {
         zone = QTAILQ_FIRST(&ns->imp_open_zones);
         if (zone) {
             /*
@@ -2006,6 +2011,7 @@ enum {
 static uint16_t nvme_zrm_open_flags(NvmeCtrl *n, NvmeNamespace *ns,
                                     NvmeZone *zone, int flags)
 {
+    BlockDriverState *bs = blk_bs(ns->blkconf.blk);
     int act = 0;
     uint16_t status;
 
@@ -2026,10 +2032,10 @@ static uint16_t nvme_zrm_open_flags(NvmeCtrl *n, NvmeNamespace *ns,
         }
 
         if (act) {
-            nvme_aor_inc_active(ns);
+            nvme_aor_inc_active(ns, bs);
         }
 
-        nvme_aor_inc_open(ns);
+        nvme_aor_inc_open(ns, bs);
 
         if (flags & NVME_ZRM_AUTO) {
             nvme_assign_zone_state(ns, zone, NVME_ZONE_STATE_IMPLICITLY_OPEN);
@@ -2149,6 +2155,7 @@ void nvme_rw_complete_cb(void *opaque, int ret)
     NvmeRequest *req = opaque;
     NvmeNamespace *ns = req->ns;
     BlockBackend *blk = ns->blkconf.blk;
+    BlockDriverState *bs = blk_bs(blk);
     BlockAcctCookie *acct = &req->acct;
     BlockAcctStats *stats = blk_get_stats(blk);
 
@@ -2161,7 +2168,7 @@ void nvme_rw_complete_cb(void *opaque, int ret)
         block_acct_done(stats, acct);
     }
 
-    if (ns->params.zoned && nvme_is_write(req)) {
+    if ((bs->bl.zoned_profile == BLK_ZP_ZNS) && nvme_is_write(req)) {
         nvme_finalize_zoned_write(ns, req);
     }
 
@@ -2852,6 +2859,7 @@ static void nvme_copy_out_completed_cb(void *opaque, int ret)
     NvmeCopyAIOCB *iocb = opaque;
     NvmeRequest *req = iocb->req;
     NvmeNamespace *ns = req->ns;
+    BlockDriverState *bs = blk_bs(ns->blkconf.blk);
     uint32_t nlb;
 
     nvme_copy_source_range_parse(iocb->ranges, iocb->idx, iocb->format, NULL,
@@ -2864,7 +2872,7 @@ static void nvme_copy_out_completed_cb(void *opaque, int ret)
         goto out;
     }
 
-    if (ns->params.zoned) {
+    if (bs->bl.zoned_profile == BLK_ZP_ZNS) {
         nvme_advance_zone_wp(ns, iocb->zone, nlb);
     }
 
@@ -2911,6 +2919,7 @@ static void nvme_copy_in_completed_cb(void *opaque, int ret)
     NvmeCopyAIOCB *iocb = opaque;
     NvmeRequest *req = iocb->req;
     NvmeNamespace *ns = req->ns;
+    BlockDriverState *bs = blk_bs(ns->blkconf.blk);
     uint32_t nlb;
     uint64_t slba;
     uint16_t apptag, appmask;
@@ -2976,7 +2985,7 @@ static void nvme_copy_in_completed_cb(void *opaque, int ret)
         goto invalid;
     }
 
-    if (ns->params.zoned) {
+    if (bs->bl.zoned_profile == BLK_ZP_ZNS) {
         status = nvme_check_zone_write(ns, iocb->zone, iocb->slba, nlb);
         if (status) {
             goto invalid;
@@ -3034,6 +3043,7 @@ static void nvme_do_copy(NvmeCopyAIOCB *iocb)
 {
     NvmeRequest *req = iocb->req;
     NvmeNamespace *ns = req->ns;
+    BlockDriverState *bs = blk_bs(ns->blkconf.blk);
     uint64_t slba;
     uint32_t nlb;
     size_t len;
@@ -3070,7 +3080,7 @@ static void nvme_do_copy(NvmeCopyAIOCB *iocb)
         }
     }
 
-    if (ns->params.zoned) {
+    if (bs->bl.zoned_profile == BLK_ZP_ZNS) {
         status = nvme_check_zone_read(ns, slba, nlb);
         if (status) {
             goto invalid;
@@ -3094,6 +3104,7 @@ done:
 static uint16_t nvme_copy(NvmeCtrl *n, NvmeRequest *req)
 {
     NvmeNamespace *ns = req->ns;
+    BlockDriverState *bs = blk_bs(ns->blkconf.blk);
     NvmeCopyCmd *copy = (NvmeCopyCmd *)&req->cmd;
     NvmeCopyAIOCB *iocb = blk_aio_get(&nvme_copy_aiocb_info, ns->blkconf.blk,
                                       nvme_misc_cb, req);
@@ -3146,7 +3157,7 @@ static uint16_t nvme_copy(NvmeCtrl *n, NvmeRequest *req)
 
     iocb->slba = le64_to_cpu(copy->sdlba);
 
-    if (ns->params.zoned) {
+    if (bs->bl.zoned_profile == BLK_ZP_ZNS) {
         iocb->zone = nvme_get_zone_by_slba(ns, iocb->slba);
         if (!iocb->zone) {
             status = NVME_LBA_RANGE | NVME_DNR;
@@ -3379,6 +3390,7 @@ static uint16_t nvme_read(NvmeCtrl *n, NvmeRequest *req)
 {
     NvmeRwCmd *rw = (NvmeRwCmd *)&req->cmd;
     NvmeNamespace *ns = req->ns;
+    BlockDriverState *bs = blk_bs(ns->blkconf.blk);
     uint64_t slba = le64_to_cpu(rw->slba);
     uint32_t nlb = (uint32_t)le16_to_cpu(rw->nlb) + 1;
     uint8_t prinfo = NVME_RW_PRINFO(le16_to_cpu(rw->control));
@@ -3412,7 +3424,7 @@ static uint16_t nvme_read(NvmeCtrl *n, NvmeRequest *req)
         goto invalid;
     }
 
-    if (ns->params.zoned) {
+    if (bs->bl.zoned_profile == BLK_ZP_ZNS) {
         status = nvme_check_zone_read(ns, slba, nlb);
         if (status) {
             trace_pci_nvme_err_zone_read_not_ok(slba, nlb, status);
@@ -3488,6 +3500,7 @@ static uint16_t nvme_do_write(NvmeCtrl *n, NvmeRequest *req, bool append,
 {
     NvmeRwCmd *rw = (NvmeRwCmd *)&req->cmd;
     NvmeNamespace *ns = req->ns;
+    BlockDriverState *bs = blk_bs(ns->blkconf.blk);
     uint64_t slba = le64_to_cpu(rw->slba);
     uint32_t nlb = (uint32_t)le16_to_cpu(rw->nlb) + 1;
     uint16_t ctrl = le16_to_cpu(rw->control);
@@ -3527,7 +3540,7 @@ static uint16_t nvme_do_write(NvmeCtrl *n, NvmeRequest *req, bool append,
         goto invalid;
     }
 
-    if (ns->params.zoned) {
+    if (bs->bl.zoned_profile == BLK_ZP_ZNS) {
         zone = nvme_get_zone_by_slba(ns, slba);
         assert(zone);
 
@@ -3642,10 +3655,11 @@ static inline uint16_t nvme_zone_append(NvmeCtrl *n, NvmeRequest *req)
 static uint16_t nvme_get_mgmt_zone_slba_idx(NvmeNamespace *ns, NvmeCmd *c,
                                             uint64_t *slba, uint32_t *zone_idx)
 {
+    BlockDriverState *bs = blk_bs(ns->blkconf.blk);
     uint32_t dw10 = le32_to_cpu(c->cdw10);
     uint32_t dw11 = le32_to_cpu(c->cdw11);
 
-    if (!ns->params.zoned) {
+    if (bs->bl.zoned_profile != BLK_ZP_ZNS) {
         trace_pci_nvme_err_invalid_opc(c->opcode);
         return NVME_INVALID_OPCODE | NVME_DNR;
     }
@@ -3725,6 +3739,7 @@ static uint16_t nvme_offline_zone(NvmeNamespace *ns, NvmeZone *zone,
 
 static uint16_t nvme_set_zd_ext(NvmeNamespace *ns, NvmeZone *zone)
 {
+    BlockDriverState *bs = blk_bs(ns->blkconf.blk);
     uint16_t status;
     uint8_t state = nvme_get_zone_state(zone);
 
@@ -3733,7 +3748,7 @@ static uint16_t nvme_set_zd_ext(NvmeNamespace *ns, NvmeZone *zone)
         if (status) {
             return status;
         }
-        nvme_aor_inc_active(ns);
+        nvme_aor_inc_active(ns, bs);
         zone->d.za |= NVME_ZA_ZD_EXT_VALID;
         nvme_assign_zone_state(ns, zone, NVME_ZONE_STATE_CLOSED);
         return NVME_SUCCESS;
@@ -6487,7 +6502,8 @@ done:
 
 static uint16_t nvme_format_check(NvmeNamespace *ns, uint8_t lbaf, uint8_t pi)
 {
-    if (ns->params.zoned) {
+    BlockDriverState *bs = blk_bs(ns->blkconf.blk);
+    if (bs->bl.zoned_profile == BLK_ZP_ZNS) {
         return NVME_INVALID_FORMAT | NVME_DNR;
     }
 

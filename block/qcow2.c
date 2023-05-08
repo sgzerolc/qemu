@@ -606,6 +606,7 @@ qcow2_read_extensions(BlockDriverState *bs, uint64_t start_offset,
             }
 
             zoned_ext.zone_size = be32_to_cpu(zoned_ext.zone_size);
+            zoned_ext.zone_capacity = be32_to_cpu(zoned_ext.zone_capacity);
             zoned_ext.nr_zones = be32_to_cpu(zoned_ext.nr_zones);
             zoned_ext.zone_nr_conv = be32_to_cpu(zoned_ext.zone_nr_conv);
             zoned_ext.max_open_zones = be32_to_cpu(zoned_ext.max_open_zones);
@@ -2153,6 +2154,8 @@ static void qcow2_refresh_limits(BlockDriverState *bs, Error **errp)
     bs->bl.pwrite_zeroes_alignment = s->subcluster_size;
     bs->bl.pdiscard_alignment = s->cluster_size;
     bs->bl.zoned = s->zoned_header.zoned;
+    bs->bl.zoned_profile = s->zoned_header.zoned_profile;
+    bs->bl.zone_capacity = s->zoned_header.zone_capacity;
     bs->bl.nr_zones = s->zoned_header.nr_zones;
     bs->wps = s->wps;
     bs->bl.max_append_sectors = s->zoned_header.max_append_sectors;
@@ -4052,12 +4055,17 @@ qcow2_co_create(BlockdevCreateOptions *create_options, Error **errp)
         s->image_data_file = g_strdup(data_bs->filename);
     }
 
-    if (!strcmp(qcow2_opts->zoned_profile, "zbc")) {
+    if (qcow2_opts->zoned_profile) {
         BDRVQcow2State *s = blk_bs(blk)->opaque;
-        s->zoned_header.zoned_profile = BLK_ZP_ZBC;
+        if (!strcmp(qcow2_opts->zoned_profile, "zbc")) {
+            s->zoned_header.zoned_profile = BLK_ZP_ZBC;
+            s->zoned_header.zone_capacity = qcow2_opts->zone_size;
+        } else if (!strcmp(qcow2_opts->zoned_profile, "zns")) {
+            s->zoned_header.zoned_profile = BLK_ZP_ZNS;
+            s->zoned_header.zone_capacity = qcow2_opts->zone_capacity;
+        }
         s->zoned_header.zoned = BLK_Z_HM;
         s->zoned_header.zone_size = qcow2_opts->zone_size;
-        s->zoned_header.zone_capacity = qcow2_opts->zone_capacity;
         s->zoned_header.zone_nr_conv = qcow2_opts->zone_nr_conv;
         s->zoned_header.max_open_zones = qcow2_opts->max_open_zones;
         s->zoned_header.max_active_zones = qcow2_opts->max_active_zones;
@@ -4471,7 +4479,7 @@ qcow2_co_zone_report(BlockDriverState *bs, int64_t offset,
             } else {
                 zones[i].length = zone_size;
             }
-            zones[i].cap = zone_size;
+            zones[i].cap = s->zoned_header.zone_capacity;
 
             uint64_t wp = s->wps->wp[si + i];
             if (QCOW2_ZT_IS_CONV(wp)) {
