@@ -189,10 +189,7 @@ typedef struct NvmeNamespaceParams {
     uint32_t mcl;
     uint8_t  msrc;
 
-    bool     zoned;
     bool     cross_zone_read;
-    uint64_t zone_size_bs;
-    uint64_t zone_cap_bs;
     uint32_t max_active_zones;
     uint32_t max_open_zones;
     uint32_t zd_extension_size;
