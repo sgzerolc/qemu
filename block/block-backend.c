@@ -2384,9 +2384,19 @@ int blk_get_zone_info(BlockBackend *blk, const char *info)
         return bs->bl.zoned_profile;
     } else if (g_strcmp0(info, "zoned")) {
         return bs->bl.zoned;
+    } else if (g_strcmp0(info, "zd_ext_size")) {
+        return bs->bl.zd_extension_size;
     } else {
         return 0;
     }
+}
+
+uint8_t *blk_get_zone_extension(BlockBackend *blk)
+{
+    BlockDriverState *bs = blk_bs(blk);
+    IO_CODE();
+
+    return bs ? bs->zd_extensions : NULL;
 }
 
 void *blk_try_blockalign(BlockBackend *blk, size_t size)
