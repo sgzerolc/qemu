@@ -356,6 +356,8 @@ The fields of the zoned extension are:
           28 - 31:  max_append_sectors
           32 - 39:  zonedmeta_offset
           40 - 47:  zonedmeta_size
+          48 - 51:  zd_extension_size
+          52 - 55:  Reserved, must be zero.
 
 == Full disk encryption header pointer ==
 

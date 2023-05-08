@@ -5024,6 +5024,8 @@
 #                 (default: off, since 8.0)
 # @zone-size: The size of a zone of the zoned device (since 8.0)
 # @zone-capacity: The capacity of a zone of the zoned device (since 8.0)
+# @zd-extension-size: Zone descriptor extension size. Must be a multiple of
+#                     64 bytes (since 8.0)
 # @zone-nr-conv: The number of conventional zones of the zoned device
 #                (since 8.0)
 # @max-open-zones: The maximal allowed open zones (since 8.0)
@@ -5052,6 +5054,7 @@
             '*zoned-profile':      'str',
             '*zone-size':          'size',
             '*zone-capacity':      'size',
+            '*zd-extension-size':  'size',
             '*zone-nr-conv':       'uint32',
             '*max-open-zones':     'uint32',
             '*max-active-zones':   'uint32',
