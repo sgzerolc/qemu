@@ -2362,6 +2362,33 @@ int blk_get_max_iov(BlockBackend *blk)
     return blk->root->bs->bl.max_iov;
 }
 
+int blk_get_zone_info(BlockBackend *blk, const char *info)
+{
+    BlockDriverState *bs = blk_bs(blk);
+    IO_CODE();
+    if (!bs) {
+        return 0;
+    }
+    if (g_strcmp0(info, "zone_size") == 0) {
+        return bs->bl.zone_size;
+    } else if (g_strcmp0(info, "zone_capacity") == 0) {
+        return bs->bl.zone_capacity ?
+            bs->bl.zone_capacity : bs->bl.zone_size;
+    } else if (g_strcmp0(info, "mar")) {
+        return bs->bl.max_active_zones;
+    } else if (g_strcmp0(info, "mor")) {
+        return bs->bl.max_active_zones;
+    } else if (g_strcmp0(info, "mzap")) {
+        return bs->bl.max_append_sectors;
+    } else if (g_strcmp0(info, "zone_profile")) {
+        return bs->bl.zoned_profile;
+    } else if (g_strcmp0(info, "zoned")) {
+        return bs->bl.zoned;
+    } else {
+        return 0;
+    }
+}
+
 void *blk_try_blockalign(BlockBackend *blk, size_t size)
 {
     IO_CODE();
