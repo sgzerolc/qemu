@@ -99,6 +99,15 @@ void blk_error_action(BlockBackend *blk, BlockErrorAction action,
 void blk_iostatus_set_err(BlockBackend *blk, int error);
 int blk_get_max_iov(BlockBackend *blk);
 int blk_get_max_hw_iov(BlockBackend *blk);
+uint8_t blk_get_zone_model(BlockBackend *blk);
+uint32_t blk_get_zone_size(BlockBackend *blk);
+uint32_t blk_get_zone_capacity(BlockBackend *blk);
+uint32_t blk_get_max_open_zones(BlockBackend *blk);
+uint32_t blk_get_max_active_zones(BlockBackend *blk);
+uint32_t blk_get_max_append_sectors(BlockBackend *blk);
+uint32_t blk_get_nr_zones(BlockBackend *blk);
+uint32_t blk_get_write_granularity(BlockBackend *blk);
+BlockZoneWps *blk_get_zone_wps(BlockBackend *blk);
 
 AioContext *blk_get_aio_context(BlockBackend *blk);
 BlockAcctStats *blk_get_stats(BlockBackend *blk);

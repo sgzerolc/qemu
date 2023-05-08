@@ -25,7 +25,6 @@
 #include "trace.h"
 
 #define MIN_DISCARD_GRANULARITY (4 * KiB)
-#define NVME_DEFAULT_ZONE_SIZE   (128 * MiB)
 
 void nvme_ns_init_format(NvmeNamespace *ns)
 {
@@ -177,19 +176,11 @@ static int nvme_ns_init_blk(NvmeNamespace *ns, Error **errp)
 
 static int nvme_ns_zoned_check_calc_geometry(NvmeNamespace *ns, Error **errp)
 {
-    uint64_t zone_size, zone_cap;
+    BlockBackend *blk = ns->blkconf.blk;
+    uint64_t zone_size = blk_get_zone_size(blk);
+    uint64_t zone_cap = blk_get_zone_capacity(blk);
 
     /* Make sure that the values of ZNS properties are sane */
-    if (ns->params.zone_size_bs) {
-        zone_size = ns->params.zone_size_bs;
-    } else {
-        zone_size = NVME_DEFAULT_ZONE_SIZE;
-    }
-    if (ns->params.zone_cap_bs) {
-        zone_cap = ns->params.zone_cap_bs;
-    } else {
-        zone_cap = zone_size;
-    }
     if (zone_cap > zone_size) {
         error_setg(errp, "zone capacity %"PRIu64"B exceeds "
                    "zone size %"PRIu64"B", zone_cap, zone_size);
@@ -266,6 +257,7 @@ static void nvme_ns_zoned_init_state(NvmeNamespace *ns)
 
 static void nvme_ns_init_zoned(NvmeNamespace *ns)
 {
+    BlockBackend *blk = ns->blkconf.blk;
     NvmeIdNsZoned *id_ns_z;
     int i;
 
@@ -274,8 +266,8 @@ static void nvme_ns_init_zoned(NvmeNamespace *ns)
     id_ns_z = g_new0(NvmeIdNsZoned, 1);
 
     /* MAR/MOR are zeroes-based, FFFFFFFFFh means no limit */
-    id_ns_z->mar = cpu_to_le32(ns->params.max_active_zones - 1);
-    id_ns_z->mor = cpu_to_le32(ns->params.max_open_zones - 1);
+    id_ns_z->mar = cpu_to_le32(blk_get_max_active_zones(blk) - 1);
+    id_ns_z->mor = cpu_to_le32(blk_get_max_open_zones(blk) - 1);
     id_ns_z->zoc = 0;
     id_ns_z->ozcs = ns->params.cross_zone_read ?
         NVME_ID_NS_ZONED_OZCS_RAZB : 0x00;
@@ -539,6 +531,7 @@ static bool nvme_ns_init_fdp(NvmeNamespace *ns, Error **errp)
 
 static int nvme_ns_check_constraints(NvmeNamespace *ns, Error **errp)
 {
+    BlockBackend *blk = ns->blkconf.blk;
     unsigned int pi_size;
 
     if (!ns->blkconf.blk) {
@@ -577,25 +570,12 @@ static int nvme_ns_check_constraints(NvmeNamespace *ns, Error **errp)
         return -1;
     }
 
-    if (ns->params.zoned && ns->endgrp && ns->endgrp->fdp.enabled) {
+    if (blk_get_zone_model(blk) && ns->endgrp && ns->endgrp->fdp.enabled) {
         error_setg(errp, "cannot be a zoned- in an FDP configuration");
         return -1;
     }
 
-    if (ns->params.zoned) {
-        if (ns->params.max_active_zones) {
-            if (ns->params.max_open_zones > ns->params.max_active_zones) {
-                error_setg(errp, "max_open_zones (%u) exceeds "
-                           "max_active_zones (%u)", ns->params.max_open_zones,
-                           ns->params.max_active_zones);
-                return -1;
-            }
-
-            if (!ns->params.max_open_zones) {
-                ns->params.max_open_zones = ns->params.max_active_zones;
-            }
-        }
-
+    if (blk_get_zone_model(blk)) {
         if (ns->params.zd_extension_size) {
             if (ns->params.zd_extension_size & 0x3f) {
                 error_setg(errp, "zone descriptor extension size must be a "
@@ -630,14 +610,14 @@ static int nvme_ns_check_constraints(NvmeNamespace *ns, Error **errp)
                 return -1;
             }
 
-            if (ns->params.max_active_zones) {
-                if (ns->params.numzrwa > ns->params.max_active_zones) {
+            int maz = blk_get_max_active_zones(blk);
+            if (maz) {
+                if (ns->params.numzrwa > maz) {
                     error_setg(errp, "number of zone random write area "
                                "resources (zoned.numzrwa, %d) must be less "
                                "than or equal to maximum active resources "
                                "(zoned.max_active_zones, %d)",
-                               ns->params.numzrwa,
-                               ns->params.max_active_zones);
+                               ns->params.numzrwa, maz);
                     return -1;
                 }
             }
@@ -660,7 +640,7 @@ int nvme_ns_setup(NvmeNamespace *ns, Error **errp)
     if (nvme_ns_init(ns, errp)) {
         return -1;
     }
-    if (ns->params.zoned) {
+    if (blk_get_zone_model(ns->blkconf.blk)) {
         if (nvme_ns_zoned_check_calc_geometry(ns, errp) != 0) {
             return -1;
         }
@@ -683,15 +663,17 @@ void nvme_ns_drain(NvmeNamespace *ns)
 
 void nvme_ns_shutdown(NvmeNamespace *ns)
 {
-    blk_flush(ns->blkconf.blk);
-    if (ns->params.zoned) {
+
+    BlockBackend *blk = ns->blkconf.blk;
+    blk_flush(blk);
+    if (blk_get_zone_model(blk)) {
         nvme_zoned_ns_shutdown(ns);
     }
 }
 
 void nvme_ns_cleanup(NvmeNamespace *ns)
 {
-    if (ns->params.zoned) {
+    if (blk_get_zone_model(ns->blkconf.blk)) {
         g_free(ns->id_ns_zoned);
         g_free(ns->zone_array);
         g_free(ns->zd_extensions);
@@ -806,11 +788,6 @@ static Property nvme_ns_props[] = {
     DEFINE_PROP_UINT16("mssrl", NvmeNamespace, params.mssrl, 128),
     DEFINE_PROP_UINT32("mcl", NvmeNamespace, params.mcl, 128),
     DEFINE_PROP_UINT8("msrc", NvmeNamespace, params.msrc, 127),
-    DEFINE_PROP_BOOL("zoned", NvmeNamespace, params.zoned, false),
-    DEFINE_PROP_SIZE("zoned.zone_size", NvmeNamespace, params.zone_size_bs,
-                     NVME_DEFAULT_ZONE_SIZE),
-    DEFINE_PROP_SIZE("zoned.zone_capacity", NvmeNamespace, params.zone_cap_bs,
-                     0),
     DEFINE_PROP_BOOL("zoned.cross_read", NvmeNamespace,
                      params.cross_zone_read, false),
     DEFINE_PROP_UINT32("zoned.max_active", NvmeNamespace,
