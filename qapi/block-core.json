@@ -5034,6 +5034,9 @@
 # @nr-conv-zones: The number of conventional zones of the zoned device
 #     (since 8.2)
 #
+# @zone-descriptor-extension-size: The size of zone descriptor extension
+#     data. Must be a multiple of 64 bytes (since 8.2)
+#
 # @max-open-zones: The maximal number of open zones (since 8.2)
 #
 # @max-active-zones: The limit of the zones that have the implicit
@@ -5063,6 +5066,7 @@
             '*zone-size':          'size',
             '*zone-capacity':      'size',
             '*nr-conv-zones':      'uint32',
+            '*zone-descriptor-extension-size':  'size',
             '*max-open-zones':     'uint32',
             '*max-active-zones':   'uint32',
             '*max-append-sectors': 'uint32' } }

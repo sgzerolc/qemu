@@ -373,6 +373,9 @@ The fields of the zoned extension are:
           44 - 51:  zonedmeta_size
                     The size of zoned metadata in bytes.
 
+          44 - 51:  zd_extension_size
+                    The size of zone descriptor extension data in bytes.
+
 == Full disk encryption header pointer ==
 
 The full disk encryption header must be present if, and only if, the

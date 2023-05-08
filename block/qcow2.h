@@ -249,6 +249,7 @@ typedef struct Qcow2ZonedHeaderExtension {
     uint32_t max_append_sectors;
     uint64_t zonedmeta_offset;
     uint64_t zonedmeta_size;
+    uint32_t zd_extension_size; /* must be multiple of 64 B */
 } QEMU_PACKED Qcow2ZonedHeaderExtension;
 
 typedef struct Qcow2Wp {
@@ -452,6 +453,7 @@ typedef struct BDRVQcow2State {
     uint32_t nr_zones_exp_open;
     uint32_t nr_zones_imp_open;
     uint32_t nr_zones_closed;
+    uint64_t zded_size;
 } BDRVQcow2State;
 
 typedef struct Qcow2COWRegion {
