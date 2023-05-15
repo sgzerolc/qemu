@@ -219,34 +219,8 @@ static int nvme_ns_zoned_check_calc_geometry(NvmeNamespace *ns, Error **errp)
 static void nvme_ns_zoned_init_state(NvmeNamespace *ns)
 {
     BlockBackend *blk = ns->blkconf.blk;
-    uint64_t start = 0, zone_size = ns->zone_size;
-    uint64_t capacity = ns->num_zones * zone_size;
-    NvmeZone *zone;
-    int i;
-
-    ns->zone_array = g_new0(NvmeZone, ns->num_zones);
     if (blk_get_zone_extension(blk)) {
         ns->zd_extensions = blk_get_zone_extension(blk);
-    }
-
-    QTAILQ_INIT(&ns->exp_open_zones);
-    QTAILQ_INIT(&ns->imp_open_zones);
-    QTAILQ_INIT(&ns->closed_zones);
-    QTAILQ_INIT(&ns->full_zones);
-
-    zone = ns->zone_array;
-    for (i = 0; i < ns->num_zones; i++, zone++) {
-        if (start + zone_size > capacity) {
-            zone_size = capacity - start;
-        }
-        zone->d.zt = NVME_ZONE_TYPE_SEQ_WRITE;
-        nvme_set_zone_state(zone, NVME_ZONE_STATE_EMPTY);
-        zone->d.za = 0;
-        zone->d.zcap = ns->zone_capacity;
-        zone->d.zslba = start;
-        zone->d.wp = start;
-        zone->w_ptr = start;
-        start += zone_size;
     }
 
     ns->zone_size_log2 = 0;
@@ -319,56 +293,12 @@ static void nvme_ns_init_zoned(NvmeNamespace *ns)
     ns->id_ns_zoned = id_ns_z;
 }
 
-static void nvme_clear_zone(NvmeNamespace *ns, NvmeZone *zone)
-{
-    uint8_t state;
-
-    zone->w_ptr = zone->d.wp;
-    state = nvme_get_zone_state(zone);
-    if (zone->d.wp != zone->d.zslba ||
-        (zone->d.za & NVME_ZA_ZD_EXT_VALID)) {
-        if (state != NVME_ZONE_STATE_CLOSED) {
-            trace_pci_nvme_clear_ns_close(state, zone->d.zslba);
-            nvme_set_zone_state(zone, NVME_ZONE_STATE_CLOSED);
-        }
-        nvme_aor_inc_active(ns);
-        QTAILQ_INSERT_HEAD(&ns->closed_zones, zone, entry);
-    } else {
-        trace_pci_nvme_clear_ns_reset(state, zone->d.zslba);
-        if (zone->d.za & NVME_ZA_ZRWA_VALID) {
-            zone->d.za &= ~NVME_ZA_ZRWA_VALID;
-            ns->zns.numzrwa++;
-        }
-        nvme_set_zone_state(zone, NVME_ZONE_STATE_EMPTY);
-    }
-}
-
 /*
  * Close all the zones that are currently open.
  */
 static void nvme_zoned_ns_shutdown(NvmeNamespace *ns)
 {
-    NvmeZone *zone, *next;
-
-    QTAILQ_FOREACH_SAFE(zone, &ns->closed_zones, entry, next) {
-        QTAILQ_REMOVE(&ns->closed_zones, zone, entry);
-        nvme_aor_dec_active(ns);
-        nvme_clear_zone(ns, zone);
-    }
-    QTAILQ_FOREACH_SAFE(zone, &ns->imp_open_zones, entry, next) {
-        QTAILQ_REMOVE(&ns->imp_open_zones, zone, entry);
-        nvme_aor_dec_open(ns);
-        nvme_aor_dec_active(ns);
-        nvme_clear_zone(ns, zone);
-    }
-    QTAILQ_FOREACH_SAFE(zone, &ns->exp_open_zones, entry, next) {
-        QTAILQ_REMOVE(&ns->exp_open_zones, zone, entry);
-        nvme_aor_dec_open(ns);
-        nvme_aor_dec_active(ns);
-        nvme_clear_zone(ns, zone);
-    }
-
-    assert(ns->nr_open_zones == 0);
+    /* Set states (exp/imp_open/closed/full) to empty */
 }
 
 static NvmeRuHandle *nvme_find_ruh_by_attr(NvmeEnduranceGroup *endgrp,
@@ -662,7 +592,6 @@ void nvme_ns_cleanup(NvmeNamespace *ns)
 {
     if (blk_get_zone_model(ns->blkconf.blk)) {
         g_free(ns->id_ns_zoned);
-        g_free(ns->zone_array);
     }
 
     if (ns->endgrp && ns->endgrp->fdp.enabled) {
@@ -776,10 +705,6 @@ static Property nvme_ns_props[] = {
     DEFINE_PROP_UINT8("msrc", NvmeNamespace, params.msrc, 127),
     DEFINE_PROP_BOOL("zoned.cross_read", NvmeNamespace,
                      params.cross_zone_read, false),
-    DEFINE_PROP_UINT32("zoned.max_active", NvmeNamespace,
-                       params.max_active_zones, 0),
-    DEFINE_PROP_UINT32("zoned.max_open", NvmeNamespace,
-                       params.max_open_zones, 0),
     DEFINE_PROP_UINT32("zoned.numzrwa", NvmeNamespace, params.numzrwa, 0),
     DEFINE_PROP_SIZE("zoned.zrwas", NvmeNamespace, params.zrwas, 0),
     DEFINE_PROP_SIZE("zoned.zrwafg", NvmeNamespace, params.zrwafg, -1),
