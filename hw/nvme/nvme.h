@@ -144,8 +144,11 @@ static inline NvmeNamespace *nvme_subsys_ns(NvmeSubsystem *subsys,
 #define NVME_NS(obj) \
     OBJECT_CHECK(NvmeNamespace, (obj), TYPE_NVME_NS)
 
+#define TO_DO_STATE 0
+#define TO_DO_ZA 0
+
 typedef struct NvmeZone {
-    NvmeZoneDescr   d;
+    BlockZoneDescriptor   d;
     uint64_t        w_ptr;
     QTAILQ_ENTRY(NvmeZone) entry;
 } NvmeZone;
@@ -222,10 +225,10 @@ typedef struct NvmeNamespace {
 
     NvmeIdNsZoned   *id_ns_zoned;
     NvmeZone        *zone_array;
-    QTAILQ_HEAD(, NvmeZone) exp_open_zones;
-    QTAILQ_HEAD(, NvmeZone) imp_open_zones;
-    QTAILQ_HEAD(, NvmeZone) closed_zones;
-    QTAILQ_HEAD(, NvmeZone) full_zones;
+    uint32_t        *exp_open_zones;
+    uint32_t        *imp_open_zones;
+    uint32_t        *closed_zones;
+    uint32_t        *full_zones;
     uint32_t        num_zones;
     uint64_t        zone_size;
     uint64_t        zone_capacity;
@@ -278,34 +281,34 @@ static inline bool nvme_ns_ext(NvmeNamespace *ns)
     return !!NVME_ID_NS_FLBAS_EXTENDED(ns->id_ns.flbas);
 }
 
-static inline NvmeZoneState nvme_get_zone_state(NvmeZone *zone)
+static inline NvmeZoneState nvme_get_zone_state(uint64_t wp)
 {
-    return zone->d.zs >> 4;
+    return wp >> 60;
 }
 
 static inline void nvme_set_zone_state(NvmeZone *zone, NvmeZoneState state)
 {
-    zone->d.zs = state << 4;
+    zone->d.state = state << 4;
 }
 
 static inline uint64_t nvme_zone_rd_boundary(NvmeNamespace *ns, NvmeZone *zone)
 {
-    return zone->d.zslba + ns->zone_size;
+    return zone->d.start + ns->zone_size;
 }
 
 static inline uint64_t nvme_zone_wr_boundary(NvmeZone *zone)
 {
-    return zone->d.zslba + zone->d.zcap;
+    return zone->d.start + zone->d.cap;
 }
 
-static inline bool nvme_wp_is_valid(NvmeZone *zone)
-{
-    uint8_t st = nvme_get_zone_state(zone);
-
-    return st != NVME_ZONE_STATE_FULL &&
-           st != NVME_ZONE_STATE_READ_ONLY &&
-           st != NVME_ZONE_STATE_OFFLINE;
-}
+//static inline bool nvme_wp_is_valid(NvmeZone *zone)
+//{
+//    uint8_t st = nvme_get_zone_state(zone);
+//
+//    return st != NVME_ZONE_STATE_FULL &&
+//           st != NVME_ZONE_STATE_READ_ONLY &&
+//           st != NVME_ZONE_STATE_OFFLINE;
+//}
 
 static inline uint8_t *nvme_get_zd_extension(NvmeNamespace *ns,
                                              uint32_t zone_idx)

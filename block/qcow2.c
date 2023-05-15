@@ -4549,6 +4549,7 @@ qcow2_co_zone_report(BlockDriverState *bs, int64_t offset,
                 /* Clear the zone type bit */
                 wp &= ~(1ULL << 59);
             } else {
+                /* TODO: type is defined by the device, it can be SWR, ...  */
                 zones[i].type = BLK_ZT_SWR;
                 zones[i].state = qcow2_get_zs(wp);
                 /* Clear the zone state bits */
@@ -4795,6 +4796,9 @@ static int coroutine_fn qcow2_co_zone_mgmt(BlockDriverState *bs, BlockZoneOp op,
         break;
     case BLK_ZO_RESET:
         ret = qcow2_reset_zone(bs, index, len);
+        break;
+    case BLK_ZO_OFFLINE:
+        ret = qcow2_write_wp_at(bs, &wps->wp[index], index, BLK_ZO_OFFLINE);
         break;
     default:
         error_report("Unsupported zone op: 0x%x", op);
