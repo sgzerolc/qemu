@@ -99,6 +99,7 @@ void blk_error_action(BlockBackend *blk, BlockErrorAction action,
 void blk_iostatus_set_err(BlockBackend *blk, int error);
 int blk_get_max_iov(BlockBackend *blk);
 int blk_get_max_hw_iov(BlockBackend *blk);
+uint8_t blk_get_zone_macro(BlockBackend *blk, const char *macro);
 int blk_get_zone_info(BlockBackend *blk, const char *info);
 uint8_t *blk_get_zone_extension(BlockBackend *blk);
 

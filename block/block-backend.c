@@ -2362,6 +2362,24 @@ int blk_get_max_iov(BlockBackend *blk)
     return blk->root->bs->bl.max_iov;
 }
 
+uint8_t blk_get_zone_macro(BlockBackend *blk, const char *macro)
+{
+    BlockDriverState *bs = blk_bs(blk);
+    IO_CODE();
+    if (!bs) {
+        return 0;
+    }
+    if (g_strcmp0(macro, "zoned") == 0) {
+        return bs->bl.zoned;
+    } else if (g_strcmp0(macro, "zone_profile")) {
+        return bs->bl.zoned_profile;
+    } else if (g_strcmp0(macro, "za")) {
+        return bs->bl.zone_attribute;
+    }
+
+    return 0;
+}
+
 int blk_get_zone_info(BlockBackend *blk, const char *info)
 {
     BlockDriverState *bs = blk_bs(blk);
@@ -2380,12 +2398,10 @@ int blk_get_zone_info(BlockBackend *blk, const char *info)
         return bs->bl.max_active_zones;
     } else if (g_strcmp0(info, "mzap")) {
         return bs->bl.max_append_sectors;
-    } else if (g_strcmp0(info, "zone_profile")) {
-        return bs->bl.zoned_profile;
-    } else if (g_strcmp0(info, "zoned")) {
-        return bs->bl.zoned;
     } else if (g_strcmp0(info, "zd_ext_size")) {
         return bs->bl.zd_extension_size;
+    } else if (g_strcmp0(info, "nr_zones")) {
+        return bs->bl.nr_zones;
     } else {
         return 0;
     }

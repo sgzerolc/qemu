@@ -906,6 +906,8 @@ typedef struct BlockLimits {
     uint32_t write_granularity;
 
     uint32_t zd_extension_size;
+
+    uint8_t zone_attribute;
 } BlockLimits;
 
 typedef struct BdrvOpBlocker BdrvOpBlocker;
