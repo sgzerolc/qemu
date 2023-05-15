@@ -83,6 +83,7 @@ typedef enum BlockZoneOp {
     BLK_ZO_CLOSE,
     BLK_ZO_FINISH,
     BLK_ZO_RESET,
+    BLK_ZO_OFFLINE,
 } BlockZoneOp;
 
 typedef enum BlockZoneModel {
@@ -261,6 +262,13 @@ typedef enum {
  * the zone type is SWR.
  */
 #define BDRV_ZT_IS_CONV(wp)    (wp & (1ULL << 63))
+
+/*
+ * Clear the zone state, type and attribute information in the wp.
+ */
+#define BDRV_ZP_GET_WP(wp)     ((wp << 6) >> 6)
+#define BDRV_ZP_GET_ZS(wp)     (wp >> 60)
+#define BDRV_ZP_GET_ZA(wp)      (wp & ((1ULL << 8) - 1ULL) << 51)
 
 #define BDRV_REQUEST_MAX_SECTORS MIN_CONST(SIZE_MAX >> BDRV_SECTOR_BITS, \
                                            INT_MAX >> BDRV_SECTOR_BITS)

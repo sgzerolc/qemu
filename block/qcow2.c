@@ -4854,6 +4854,9 @@ static int coroutine_fn qcow2_co_zone_mgmt(BlockDriverState *bs, BlockZoneOp op,
     case BLK_ZO_RESET:
         ret = qcow2_reset_zone(bs, index, len);
         break;
+    case BLK_ZO_OFFLINE:
+        ret = qcow2_write_wp_at(bs, &wps->wp[index], index, BLK_ZO_OFFLINE);
+        break;
     default:
         error_report("Unsupported zone op: 0x%x", op);
         ret = -ENOTSUP;

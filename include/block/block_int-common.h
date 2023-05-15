@@ -911,6 +911,8 @@ typedef struct BlockLimits {
 
     /* size of data that is associated with a zone in bytes */
     uint32_t zd_extension_size;
+
+    uint8_t zone_attribute;
 } BlockLimits;
 
 typedef struct BdrvOpBlocker BdrvOpBlocker;
