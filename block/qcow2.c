@@ -5107,6 +5107,9 @@ qcow2_co_zone_mgmt(BlockDriverState *bs, BlockZoneOp op,
     case BLK_ZO_RESET:
         ret = qcow2_reset_zone(bs, index, len);
         break;
+    case BLK_ZO_OFFLINE:
+        /* There are no transitions from the offline state to any other state */
+        break;
     default:
         error_report("Unsupported zone op: 0x%x", op);
         ret = -ENOTSUP;
