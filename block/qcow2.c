@@ -4549,6 +4549,7 @@ qcow2_co_zone_report(BlockDriverState *bs, int64_t offset,
                 /* Clear the zone type bit */
                 wp &= ~(1ULL << 59);
             } else {
+                /* TODO: type is defined by the device, it can be SWR, ...  */
                 zones[i].type = BLK_ZT_SWR;
                 zones[i].state = qcow2_get_zs(wp);
                 /* Clear the zone state bits */
