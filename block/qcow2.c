@@ -336,31 +336,39 @@ static int qcow2_check_zone_resources(BlockDriverState *bs,
 
 }
 
+/*
+ * Read zoned metadata from the file.
+ */
 static inline int qcow2_refresh_zonedmeta(BlockDriverState *bs)
 {
     int ret;
     BDRVQcow2State *s = bs->opaque;
-    uint64_t wps_size = s->zoned_header.zonedmeta_size -
-        s->zoned_header.zded_size;
-    uint64_t zded_size = s->zoned_header.zded_size;
+    uint64_t zded_size = bs->bl.nr_zones * sizeof(uint8_t);
+    uint64_t wps_size = s->zoned_header.zonedmeta_size - zded_size;
+
+    if (s->zoned_header.zoned_profile == BLK_ZP_ZNS) {
+        uint8_t *zded = g_malloc0(zded_size);
+        ret = bdrv_pread(bs->file, s->zoned_header.zonedmeta_offset + wps_size,
+                         zded_size, zded, 0);
+        if (ret < 0) {
+            error_report("Can not read zded");
+            return ret;
+        }
+
+        memcpy(s->zd_extensions, zded, zded_size);
+        g_free(zded);
+    }
+
     uint64_t *temp = g_malloc(wps_size);
     ret = bdrv_pread(bs->file, s->zoned_header.zonedmeta_offset,
                      wps_size, temp, 0);
     if (ret < 0) {
-        error_report("Can not read metadata");
-        return ret;
-    }
-
-    uint8_t *zded = g_malloc0(zded_size);
-    ret = bdrv_pread(bs->file, s->zoned_header.zonedmeta_offset + zded_size,
-                     zded_size, zded, 0);
-    if (ret < 0) {
-        error_report("Can not read zded");
+        error_report("Can not read wps");
         return ret;
     }
 
     memcpy(s->wps->wp, temp, wps_size);
-    memcpy(s->zd_extensions, zded, zded_size);
+    g_free(temp);
     return 0;
 }
 
@@ -619,8 +627,6 @@ qcow2_read_extensions(BlockDriverState *bs, uint64_t start_offset,
 
             zoned_ext.zone_size = be32_to_cpu(zoned_ext.zone_size);
             zoned_ext.zone_capacity = be32_to_cpu(zoned_ext.zone_capacity);
-            zoned_ext.zd_extension_size =
-                be32_to_cpu(zoned_ext.zd_extension_size);
             zoned_ext.nr_zones = be32_to_cpu(zoned_ext.nr_zones);
             zoned_ext.zone_nr_conv = be32_to_cpu(zoned_ext.zone_nr_conv);
             zoned_ext.max_open_zones = be32_to_cpu(zoned_ext.max_open_zones);
@@ -631,12 +637,16 @@ qcow2_read_extensions(BlockDriverState *bs, uint64_t start_offset,
             zoned_ext.zonedmeta_offset =
                 be64_to_cpu(zoned_ext.zonedmeta_offset);
             zoned_ext.zonedmeta_size = be64_to_cpu(zoned_ext.zonedmeta_size);
-            zoned_ext.zded_size = be64_to_cpu(zoned_ext.zded_size);
-            s->zoned_header = zoned_ext;
 
+            if (zoned_ext.zoned_profile == BLK_ZP_ZNS) {
+                zoned_ext.zd_extension_size =
+                    be32_to_cpu(zoned_ext.zd_extension_size);
+                s->zd_extensions = g_malloc0(zoned_ext.nr_zones *
+                    zoned_ext.zd_extension_size);
+            }
+            s->zoned_header = zoned_ext;
             s->wps = g_malloc(sizeof(BlockZoneWps)
-                + zoned_ext.zonedmeta_size - zoned_ext.zded_size);
-            s->zd_extensions = g_malloc0(zoned_ext.zded_size);
+                + s->zoned_header.zonedmeta_size);
             ret = qcow2_refresh_zonedmeta(bs);
             if (ret < 0) {
                 error_setg_errno(errp, -ret, "zonedmeta: "
@@ -4113,7 +4123,6 @@ qcow2_co_create(BlockdevCreateOptions *create_options, Error **errp)
             zded_size = s->zoned_header.zd_extension_size *
                 s->zoned_header.nr_zones;
         }
-        s->zoned_header.zded_size = zded_size;
         zoned_meta_size += zded_size;
 
         offset = qcow2_alloc_clusters(blk_bs(blk), zoned_meta_size);
@@ -4146,8 +4155,8 @@ qcow2_co_create(BlockdevCreateOptions *create_options, Error **errp)
             /* Initialize zone descriptor extensions */
             uint8_t zded[zded_size];
             printf("zded size: %ld\n", zded_size);
-            ret = bdrv_pwrite(blk_bs(blk)->file, offset + zded_size,
-                              zded_size, zded, 0);
+            ret = bdrv_pwrite(blk_bs(blk)->file, offset + zoned_meta_size
+                - zded_size, zded_size, zded, 0);
             if (ret < 0) {
                 error_setg_errno(errp, -ret, "Could not write zone descriptor"
                                              "extensions to disk");
