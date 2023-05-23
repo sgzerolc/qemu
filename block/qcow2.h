@@ -247,10 +247,9 @@ typedef struct Qcow2ZonedHeaderExtension {
     uint32_t max_active_zones;
     uint32_t max_open_zones;
     uint32_t max_append_sectors;
-    uint64_t zonedmeta_offset;
-    uint64_t zonedmeta_size;
+    uint64_t zonedmeta_offset; /* offset starts from the device file */
+    uint64_t zonedmeta_size; /* sizeof wps and zoned extension */
 
-    uint64_t zded_size;
     uint32_t zd_extension_size; /* must be multiple of 64 B */
     uint8_t padding[7];
 } QEMU_PACKED Qcow2ZonedHeaderExtension;
