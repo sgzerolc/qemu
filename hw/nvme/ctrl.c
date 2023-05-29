@@ -4127,6 +4127,7 @@ static void nvme_zone_mgmt_recv_completed_cb(void *opaque, int ret)
 
         z->zslba = cpu_to_le64(iocb->zone_report_data.zones[j].start
            >> BDRV_SECTOR_BITS);
+        printf("index[%lx]: zslba %lx\n", j, z->zslba);
         z->zcap = cpu_to_le64(iocb->zone_report_data.zones[j].cap
            >> BDRV_SECTOR_BITS);
         z->wp = cpu_to_le64(iocb->zone_report_data.zones[j].wp
@@ -4146,40 +4147,35 @@ static void nvme_zone_mgmt_recv_completed_cb(void *opaque, int ret)
             g_assert_not_reached();
         }
 
-        z->zs = 0x5;
-
-//        switch (iocb->zone_report_data.zones[j].state) {
-//        case BLK_ZS_RDONLY:
-//            z->zs = NVME_ZONE_STATE_READ_ONLY;
-//            break;
-//        case BLK_ZS_OFFLINE:
-//            z->zs = NVME_ZONE_STATE_OFFLINE;
-//            break;
-//        case BLK_ZS_EMPTY:
-//            z->zs = NVME_ZONE_STATE_EMPTY;
-//            break;
-//        case BLK_ZS_CLOSED:
-//            z->zs = NVME_ZONE_STATE_CLOSED;
-//            break;
-//        case BLK_ZS_FULL:
-//            z->zs = NVME_ZONE_STATE_FULL;
-//            break;
-//        case BLK_ZS_EOPEN:
-//            z->zs = NVME_ZONE_STATE_EXPLICITLY_OPEN;
-//            break;
-//        case BLK_ZS_IOPEN:
-//            z->zs = NVME_ZONE_STATE_IMPLICITLY_OPEN;
-//            break;
-//        case BLK_ZS_NOT_WP:
-//            z->zs = NVME_ZONE_STATE_RESERVED;
-//            break;
-//        default:
-//            g_assert_not_reached();
-//        }
-
-        printf("z->zs 0x%x\n", z->zs);
+        switch (iocb->zone_report_data.zones[j].state) {
+        case BLK_ZS_RDONLY:
+            z->zs = NVME_ZONE_STATE_READ_ONLY;
+            break;
+        case BLK_ZS_OFFLINE:
+            z->zs = NVME_ZONE_STATE_OFFLINE;
+            break;
+        case BLK_ZS_EMPTY:
+            z->zs = NVME_ZONE_STATE_EMPTY;
+            break;
+        case BLK_ZS_CLOSED:
+            z->zs = NVME_ZONE_STATE_CLOSED;
+            break;
+        case BLK_ZS_FULL:
+            z->zs = NVME_ZONE_STATE_FULL;
+            break;
+        case BLK_ZS_EOPEN:
+            z->zs = NVME_ZONE_STATE_EXPLICITLY_OPEN;
+            break;
+        case BLK_ZS_IOPEN:
+            z->zs = NVME_ZONE_STATE_IMPLICITLY_OPEN;
+            break;
+        case BLK_ZS_NOT_WP:
+            z->zs = NVME_ZONE_STATE_RESERVED;
+            break;
+        default:
+            g_assert_not_reached();
+        }
     }
-    printf("zs standard: %x\n", NVME_ZONE_STATE_EMPTY);
 
     nvme_c2h(iocb->n, (uint8_t *)buf, zrp_size, req);
     printf(".........!!!............\n");
@@ -4289,7 +4285,9 @@ static uint16_t nvme_zone_mgmt_recv(NvmeCtrl *n, NvmeRequest *req)
     iocb->zone_report_data.zones = g_malloc(
             sizeof(BlockZoneDescriptor) * nr_zones);
 
-    blk_aio_zone_report(blk, slba, &iocb->zone_report_data.nr_zones,
+    printf("slba 0x%lx\n", slba);
+    blk_aio_zone_report(blk, slba * BDRV_SECTOR_SIZE,
+                        &iocb->zone_report_data.nr_zones,
                         iocb->zone_report_data.zones,
                         nvme_zone_mgmt_recv_completed_cb, iocb);
     return status;
