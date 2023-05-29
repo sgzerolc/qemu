@@ -249,11 +249,11 @@ static void nvme_ns_zoned_init_state(NvmeNamespace *ns)
         if (start + zone_size > capacity) {
             zone_size = capacity - start;
         }
-        zone->d.zt = NVME_ZONE_TYPE_SEQ_WRITE;
+        zone->d.type = NVME_ZONE_TYPE_SEQ_WRITE;
         nvme_set_zone_state(zone, NVME_ZONE_STATE_EMPTY);
-        zone->d.za = 0;
-        zone->d.zcap = ns->zone_capacity;
-        zone->d.zslba = start;
+//        zone->d.za = 0;
+        zone->d.cap = ns->zone_capacity;
+        zone->d.start = start;
         zone->d.wp = start;
         zone->w_ptr = start;
         start += zone_size;
@@ -335,21 +335,21 @@ static void nvme_clear_zone(NvmeNamespace *ns, NvmeZone *zone)
     uint8_t state;
 
     zone->w_ptr = zone->d.wp;
-    state = nvme_get_zone_state(zone);
-    if (zone->d.wp != zone->d.zslba ||
-        (zone->d.za & NVME_ZA_ZD_EXT_VALID)) {
+    state = nvme_get_zone_state(bs->wps->wp[zone->w_ptr / bs->bl.zone_size]);
+    if (zone->d.wp != zone->d.start) {
+//        (zone->d.za & NVME_ZA_ZD_EXT_VALID)) {
         if (state != NVME_ZONE_STATE_CLOSED) {
-            trace_pci_nvme_clear_ns_close(state, zone->d.zslba);
+            trace_pci_nvme_clear_ns_close(state, zone->d.start);
             nvme_set_zone_state(zone, NVME_ZONE_STATE_CLOSED);
         }
-        nvme_aor_inc_active(ns, bs);
+//        nvme_aor_inc_active(ns, bs);
         QTAILQ_INSERT_HEAD(&ns->closed_zones, zone, entry);
     } else {
-        trace_pci_nvme_clear_ns_reset(state, zone->d.zslba);
-        if (zone->d.za & NVME_ZA_ZRWA_VALID) {
-            zone->d.za &= ~NVME_ZA_ZRWA_VALID;
-            ns->zns.numzrwa++;
-        }
+        trace_pci_nvme_clear_ns_reset(state, zone->d.start);
+//        if (zone->d.za & NVME_ZA_ZRWA_VALID) {
+//            zone->d.za &= ~NVME_ZA_ZRWA_VALID;
+//            ns->zns.numzrwa++;
+//        }
         nvme_set_zone_state(zone, NVME_ZONE_STATE_EMPTY);
     }
 }
@@ -673,6 +673,7 @@ int nvme_ns_setup(NvmeNamespace *ns, Error **errp)
         }
         nvme_ns_init_zoned(ns);
     }
+    printf("zone type: 0x%x\n", ns->zone_array[0].d.type);
 
     if (ns->endgrp && ns->endgrp->fdp.enabled) {
         if (!nvme_ns_init_fdp(ns, errp)) {
@@ -701,6 +702,7 @@ void nvme_ns_cleanup(NvmeNamespace *ns)
 {
     BlockDriverState *bs = blk_bs(ns->blkconf.blk);
     if (bs->bl.zoned_profile == BLK_ZP_ZNS) {
+        printf("clup");
         g_free(ns->id_ns_zoned);
         g_free(ns->zone_array);
         g_free(ns->zd_extensions);
