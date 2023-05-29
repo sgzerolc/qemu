@@ -4009,6 +4009,8 @@ static void nvme_zone_mgmt_send_completed_cb(void *opaque, int ret)
     return;
 }
 
+#define BLK_ZO_INVALID 0x22
+
 static uint16_t nvme_zone_mgmt_send(NvmeCtrl *n, NvmeRequest *req)
 {
     NvmeZoneSendCmd *cmd = (NvmeZoneSendCmd *)&req->cmd;
@@ -4019,6 +4021,7 @@ static uint16_t nvme_zone_mgmt_send(NvmeCtrl *n, NvmeRequest *req)
 //    NvmeZoneResetAIOCB *iocb;
 //    uint8_t *zd_ext;
     uint64_t slba = 0;
+    uint64_t offset;
     uint32_t zone_idx = 0;
     uint16_t status;
     uint8_t action = cmd->zsa;
@@ -4077,11 +4080,11 @@ static uint16_t nvme_zone_mgmt_send(NvmeCtrl *n, NvmeRequest *req)
 //        return NVME_NO_COMPLETE;
 
     case NVME_ZONE_ACTION_OFFLINE:
-        op = 0;
+        op = BLK_ZO_INVALID;
         trace_pci_nvme_offline_zone(slba, zone_idx, all);
         break;
     case NVME_ZONE_ACTION_SET_ZD_EXT:
-        op = 0;
+        op = BLK_ZO_INVALID;
         trace_pci_nvme_set_descriptor_extension(slba, zone_idx);
 //        if (all || !ns->params.zd_extension_size) {
 //            return NVME_INVALID_FIELD | NVME_DNR;
@@ -4101,7 +4104,7 @@ static uint16_t nvme_zone_mgmt_send(NvmeCtrl *n, NvmeRequest *req)
         break;
 
     case NVME_ZONE_ACTION_ZRWA_FLUSH:
-        op = 0;
+        op = BLK_ZO_INVALID;
         break;
 //        if (all) {
 //            return NVME_INVALID_FIELD | NVME_DNR;
@@ -4110,13 +4113,14 @@ static uint16_t nvme_zone_mgmt_send(NvmeCtrl *n, NvmeRequest *req)
 //        return nvme_zone_mgmt_send_zrwa_flush(n, zone, slba, req);
 
     default:
-        op = 0;
+        op = BLK_ZO_INVALID;
         trace_pci_nvme_err_invalid_mgmt_action(action);
         status = NVME_INVALID_FIELD;
     }
 
-    if (!op) {
-        blk_aio_zone_mgmt(blk, op, slba, bs->bl.zone_size,
+    if (op != BLK_ZO_INVALID) {
+        offset = slba << BDRV_SECTOR_BITS;
+        blk_aio_zone_mgmt(blk, op, offset, bs->bl.zone_size,
                           nvme_zone_mgmt_send_completed_cb, req);
     }
 
