@@ -3607,6 +3607,7 @@ static inline uint16_t nvme_write_zeroes(NvmeCtrl *n, NvmeRequest *req)
 typedef struct NvmeZoneCmdAIOCB {
     NvmeRequest *req;
     NvmeCtrl *n;
+    uint32_t data_size;
 
     union {
         struct {
@@ -4101,14 +4102,41 @@ static uint16_t nvme_zone_mgmt_send(NvmeCtrl *n, NvmeRequest *req)
     return status;
 }
 
+//static bool nvme_zone_matches_filter(uint32_t zafs, uint64_t *wp)
+//{
+//    NvmeZoneState zs = nvme_get_zone_state(*wp);
+//
+//    switch (zafs) {
+//        case NVME_ZONE_REPORT_ALL:
+//            return true;
+//        case NVME_ZONE_REPORT_EMPTY:
+//            return zs == NVME_ZONE_STATE_EMPTY;
+//        case NVME_ZONE_REPORT_IMPLICITLY_OPEN:
+//            return zs == NVME_ZONE_STATE_IMPLICITLY_OPEN;
+//        case NVME_ZONE_REPORT_EXPLICITLY_OPEN:
+//            return zs == NVME_ZONE_STATE_EXPLICITLY_OPEN;
+//        case NVME_ZONE_REPORT_CLOSED:
+//            return zs == NVME_ZONE_STATE_CLOSED;
+//        case NVME_ZONE_REPORT_FULL:
+//            return zs == NVME_ZONE_STATE_FULL;
+//        case NVME_ZONE_REPORT_READ_ONLY:
+//            return zs == NVME_ZONE_STATE_READ_ONLY;
+//        case NVME_ZONE_REPORT_OFFLINE:
+//            return zs == NVME_ZONE_STATE_OFFLINE;
+//        default:
+//            return false;
+//    }
+//}
+
 static void nvme_zone_mgmt_recv_completed_cb(void *opaque, int ret)
 {
     NvmeZoneCmdAIOCB *iocb = opaque;
     NvmeRequest *req = iocb->req;
 //    NvmeNamespace *ns = req->ns;
-    int64_t nz = iocb->zone_report_data.nr_zones;
+    uint64_t nz = iocb->zone_report_data.nr_zones;
     int64_t zrp_size, j = 0;
-    void *buf, *buf_p;
+    g_autofree void *buf = NULL;
+    void *buf_p;
     NvmeZoneReportHeader *zrp_hdr;
     NvmeZoneDescr *z;
 //    uint16_t err_status;
@@ -4119,13 +4147,14 @@ static void nvme_zone_mgmt_recv_completed_cb(void *opaque, int ret)
     }
 
     zrp_size = sizeof(NvmeZoneReportHeader) + sizeof(NvmeZoneDescr) * nz;
+//    printf("zrp nz: %ld\n", (zrp_size-sizeof(NvmeZoneReportHeader))/sizeof(NvmeZoneDescr));
     buf = g_malloc0(zrp_size);
 
     zrp_hdr = buf;
     zrp_hdr->nr_zones = cpu_to_le64(nz);
     buf_p = buf + sizeof(NvmeZoneReportHeader);
 
-    for (; j < nz; ++j) {
+    for (; j < nz; j++) {
         z = buf_p;
         buf_p += sizeof(NvmeZoneDescr);
 
@@ -4182,8 +4211,9 @@ static void nvme_zone_mgmt_recv_completed_cb(void *opaque, int ret)
     }
 
     nvme_c2h(iocb->n, (uint8_t *)buf, zrp_size, req);
+    printf("zrp_size 0x%lx, 0x%lx\n", zrp_size, iocb->zone_report_data.nr_zones * sizeof(NvmeZoneDescr)
+    + sizeof(NvmeZoneReportHeader));
     printf(".........!!!............\n");
-    g_free(buf);
 
 out:
     g_free(iocb->zone_report_data.zones);
@@ -4191,51 +4221,25 @@ out:
     return;
 }
 
-static bool nvme_zone_matches_filter(uint32_t zafs, uint64_t *wp)
-{
-    NvmeZoneState zs = nvme_get_zone_state(*wp);
-
-    switch (zafs) {
-    case NVME_ZONE_REPORT_ALL:
-        return true;
-    case NVME_ZONE_REPORT_EMPTY:
-        return zs == NVME_ZONE_STATE_EMPTY;
-    case NVME_ZONE_REPORT_IMPLICITLY_OPEN:
-        return zs == NVME_ZONE_STATE_IMPLICITLY_OPEN;
-    case NVME_ZONE_REPORT_EXPLICITLY_OPEN:
-        return zs == NVME_ZONE_STATE_EXPLICITLY_OPEN;
-    case NVME_ZONE_REPORT_CLOSED:
-        return zs == NVME_ZONE_STATE_CLOSED;
-    case NVME_ZONE_REPORT_FULL:
-        return zs == NVME_ZONE_STATE_FULL;
-    case NVME_ZONE_REPORT_READ_ONLY:
-        return zs == NVME_ZONE_STATE_READ_ONLY;
-    case NVME_ZONE_REPORT_OFFLINE:
-        return zs == NVME_ZONE_STATE_OFFLINE;
-    default:
-        return false;
-    }
-}
-
 static uint16_t nvme_zone_mgmt_recv(NvmeCtrl *n, NvmeRequest *req)
 {
     NvmeCmd *cmd = (NvmeCmd *)&req->cmd;
     NvmeNamespace *ns = req->ns;
     BlockBackend *blk = ns->blkconf.blk;
-    BlockDriverState *bs = blk_bs(blk);
-    BlockZoneWps *wps = bs->wps;
     NvmeZoneCmdAIOCB *iocb;
     /* cdw12 is zero-based number of dwords to return. Convert to bytes */
     uint32_t data_size = (le32_to_cpu(cmd->cdw12) + 1) << 2;
     uint32_t dw13 = le32_to_cpu(cmd->cdw13);
-    uint32_t zone_idx, zra, zrasf, partial;
+    uint32_t zone_idx, zra, zrasf;
     uint64_t max_zones, nr_zones = 0;
     uint16_t status;
     uint64_t slba;
+    int64_t offset;
     size_t zone_entry_sz;
-    int i;
+//    int i;
     printf("recv");
 
+    printf("sending: data_size 0x%x \n", data_size);
     req->status = NVME_SUCCESS;
 
     status = nvme_get_mgmt_zone_slba_idx(ns, cmd, &slba, &zone_idx);
@@ -4265,7 +4269,7 @@ static uint16_t nvme_zone_mgmt_recv(NvmeCtrl *n, NvmeRequest *req)
         return status;
     }
 
-    partial = (dw13 >> 16) & 0x01;
+//    partial = (dw13 >> 16) & 0x01;
 
     zone_entry_sz = sizeof(NvmeZoneDescr);
     if (zra == NVME_ZONE_REPORT_EXTENDED) {
@@ -4273,27 +4277,31 @@ static uint16_t nvme_zone_mgmt_recv(NvmeCtrl *n, NvmeRequest *req)
     }
 
     max_zones = (data_size - sizeof(NvmeZoneReportHeader)) / zone_entry_sz;
-    uint64_t *wp = &wps->wp[zone_idx];
-    for (i = zone_idx; i < ns->num_zones; i++) {
-        if (partial && nr_zones >= max_zones) {
-            break;
-        }
-        if (nvme_zone_matches_filter(zrasf, wp++)) {
-            nr_zones++;
-        }
-    }
-    iocb = g_malloc(sizeof(NvmeZoneCmdAIOCB));
+    nr_zones = max_zones;
+//    uint64_t *wp = &wps->wp[zone_idx];
+//    for (i = zone_idx; i < ns->num_zones; i++) {
+//        if (partial && nr_zones >= max_zones) {
+//            break;
+//        }
+//        if (nvme_zone_matches_filter(zrasf, wp++)) {
+//            nr_zones++;
+//        }
+//    }
+    iocb = g_malloc0(sizeof(NvmeZoneCmdAIOCB));
     iocb->req = req;
     iocb->n = n;
     iocb->zone_report_data.nr_zones = nr_zones;
-    iocb->zone_report_data.zones = g_malloc(
+    printf("nrz: %ld\n", nr_zones);
+    iocb->zone_report_data.zones = g_malloc0(
             sizeof(BlockZoneDescriptor) * nr_zones);
 
-    printf("slba 0x%lx\n", slba);
-    blk_aio_zone_report(blk, slba * BDRV_SECTOR_SIZE,
+    offset = nvme_l2b(ns, slba);
+    printf("offset 0x%lx\n", offset);
+    blk_aio_zone_report(blk, offset,
                         &iocb->zone_report_data.nr_zones,
                         iocb->zone_report_data.zones,
                         nvme_zone_mgmt_recv_completed_cb, iocb);
+    printf("status: %x\n", status);
     return status;
 }
 
