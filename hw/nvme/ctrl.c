@@ -4188,7 +4188,7 @@ static void nvme_zone_mgmt_recv_completed_cb(void *opaque, int ret)
             z->zs = NVME_ZONE_STATE_OFFLINE;
             break;
         case BLK_ZS_EMPTY:
-            z->zs = NVME_ZONE_STATE_EMPTY;
+            z->zs = NVME_ZONE_STATE_EMPTY<<4;
             break;
         case BLK_ZS_CLOSED:
             z->zs = NVME_ZONE_STATE_CLOSED;
