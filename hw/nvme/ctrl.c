@@ -1726,6 +1726,95 @@ static void nvme_misc_cb(void *opaque, int ret)
     nvme_enqueue_req_completion(nvme_cq(req), req);
 }
 
+typedef struct NvmeZoneCmdAIOCB {
+    NvmeRequest *req;
+    NvmeCmd *cmd;
+    NvmeCtrl *n;
+
+    union {
+        struct {
+          uint32_t partial;
+          unsigned int nr_zones;
+          BlockZoneDescriptor *zones;
+        } zone_report_data;
+        struct {
+          int64_t offset;
+        } zone_append_data;
+    };
+} NvmeZoneCmdAIOCB;
+
+static void nvme_blk_zone_append_complete_cb(void *opaque, int ret)
+{
+    NvmeZoneCmdAIOCB *cb = opaque;
+    NvmeRequest *req = cb->req;
+    int64_t *offset = (int64_t *)&req->cqe;
+
+    if (ret) {
+        nvme_aio_err(req, ret);
+    }
+
+    *offset = nvme_b2l(req->ns, cb->zone_append_data.offset);
+    nvme_enqueue_req_completion(nvme_cq(req), req);
+    g_free(cb);
+}
+
+static inline void nvme_blk_zone_append(BlockBackend *blk, int64_t *offset,
+                                  uint32_t align,
+                                  BlockCompletionFunc *cb,
+                                  NvmeZoneCmdAIOCB *aiocb)
+{
+    NvmeRequest *req = aiocb->req;
+    assert(req->sg.flags & NVME_SG_ALLOC);
+
+    if (req->sg.flags & NVME_SG_DMA) {
+        req->aiocb = dma_blk_zone_append(blk, &req->sg.qsg, (int64_t)offset,
+                                         align, cb, aiocb);
+    } else {
+        req->aiocb = blk_aio_zone_append(blk, offset, &req->sg.iov, 0,
+                                         cb, aiocb);
+    }
+}
+
+static void nvme_zone_append_cb(void *opaque, int ret)
+{
+    NvmeZoneCmdAIOCB *aiocb = opaque;
+    NvmeRequest *req = aiocb->req;
+    NvmeNamespace *ns = req->ns;
+
+    BlockBackend *blk = ns->blkconf.blk;
+
+    trace_pci_nvme_rw_cb(nvme_cid(req), blk_name(blk));
+
+    if (ret) {
+        goto out;
+    }
+
+    if (ns->lbaf.ms) {
+        NvmeRwCmd *rw = (NvmeRwCmd *)&req->cmd;
+        uint32_t nlb = (uint32_t)le16_to_cpu(rw->nlb) + 1;
+        int64_t offset = aiocb->zone_append_data.offset;
+
+        if (nvme_ns_ext(ns) || req->cmd.mptr) {
+            uint16_t status;
+
+            nvme_sg_unmap(&req->sg);
+            status = nvme_map_mdata(nvme_ctrl(req), nlb, req);
+            if (status) {
+                ret = -EFAULT;
+                goto out;
+            }
+
+            return nvme_blk_zone_append(blk, &offset, 1,
+                                        nvme_blk_zone_append_complete_cb,
+                                        aiocb);
+        }
+    }
+
+out:
+    nvme_blk_zone_append_complete_cb(aiocb, ret);
+}
+
+
 void nvme_rw_complete_cb(void *opaque, int ret)
 {
     NvmeRequest *req = opaque;
@@ -3052,6 +3141,9 @@ static uint16_t nvme_do_write(NvmeCtrl *n, NvmeRequest *req, bool append,
     uint64_t mapped_size = data_size;
     uint64_t data_offset;
     BlockBackend *blk = ns->blkconf.blk;
+    BlockZoneWps *wps = blk_get_zone_wps(blk);
+    uint32_t zone_size = blk_get_zone_size(blk);
+    uint32_t zone_idx;
     uint16_t status;
 
     if (nvme_ns_ext(ns)) {
@@ -3082,42 +3174,47 @@ static uint16_t nvme_do_write(NvmeCtrl *n, NvmeRequest *req, bool append,
     }
 
     if (blk_get_zone_model(blk)) {
-        uint32_t zone_size = blk_get_zone_size(blk);
-        uint32_t zone_idx = slba / zone_size;
-        int64_t zone_start = zone_idx * zone_size;
+        assert(wps);
+        if (zone_size) {
+            zone_idx = slba / zone_size;
+            int64_t zone_start = zone_idx * zone_size;
 
-        if (append) {
-            bool piremap = !!(ctrl & NVME_RW_PIREMAP);
+            if (append) {
+                bool piremap = !!(ctrl & NVME_RW_PIREMAP);
 
-            if (n->params.zasl &&
-                data_size > (uint64_t)n->page_size << n->params.zasl) {
-                trace_pci_nvme_err_zasl(data_size);
-                return NVME_INVALID_FIELD | NVME_DNR;
-            }
-
-            rw->slba = cpu_to_le64(slba);
-            switch (NVME_ID_NS_DPS_TYPE(ns->id_ns.dps)) {
-            case NVME_ID_NS_DPS_TYPE_1:
-                if (!piremap) {
-                    return NVME_INVALID_PROT_INFO | NVME_DNR;
+                if (n->params.zasl &&
+                    data_size > (uint64_t)
+                    n->page_size << n->params.zasl) {
+                    trace_pci_nvme_err_zasl(data_size);
+                    return NVME_INVALID_FIELD | NVME_DNR;
                 }
 
-                /* fallthrough */
+                rw->slba = cpu_to_le64(slba);
 
-            case NVME_ID_NS_DPS_TYPE_2:
-                if (piremap) {
-                    uint32_t reftag = le32_to_cpu(rw->reftag);
-                    rw->reftag = cpu_to_le32(reftag + (slba - zone_start));
+                switch (NVME_ID_NS_DPS_TYPE(ns->id_ns.dps)) {
+                case NVME_ID_NS_DPS_TYPE_1:
+                    if (!piremap) {
+                        return NVME_INVALID_PROT_INFO | NVME_DNR;
+                    }
+
+                    /* fallthrough */
+
+                case NVME_ID_NS_DPS_TYPE_2:
+                    if (piremap) {
+                        uint32_t reftag = le32_to_cpu(rw->reftag);
+                        rw->reftag =
+                            cpu_to_le32(reftag + (slba - zone_start));
+                    }
+
+                    break;
+
+                case NVME_ID_NS_DPS_TYPE_3:
+                    if (piremap) {
+                        return NVME_INVALID_PROT_INFO | NVME_DNR;
+                    }
+
+                    break;
                 }
-
-                break;
-
-            case NVME_ID_NS_DPS_TYPE_3:
-                if (piremap) {
-                    return NVME_INVALID_PROT_INFO | NVME_DNR;
-                }
-
-                break;
             }
         }
 
@@ -3137,9 +3234,21 @@ static uint16_t nvme_do_write(NvmeCtrl *n, NvmeRequest *req, bool append,
             goto invalid;
         }
 
-        block_acct_start(blk_get_stats(blk), &req->acct, data_size,
-                         BLOCK_ACCT_WRITE);
-        nvme_blk_write(blk, data_offset, BDRV_SECTOR_SIZE, nvme_rw_cb, req);
+        if (append) {
+            NvmeZoneCmdAIOCB *cb = g_malloc(sizeof(NvmeZoneCmdAIOCB));
+            cb->req = req;
+            cb->zone_append_data.offset = data_offset;
+
+            block_acct_start(blk_get_stats(blk), &req->acct, data_size,
+                             BLOCK_ACCT_ZONE_APPEND);
+            nvme_blk_zone_append(blk, &cb->zone_append_data.offset,
+                                 blk_get_write_granularity(blk),
+                                 nvme_zone_append_cb, cb);
+        } else {
+            block_acct_start(blk_get_stats(blk), &req->acct, data_size,
+                             BLOCK_ACCT_WRITE);
+            nvme_blk_write(blk, data_offset, BDRV_SECTOR_SIZE, nvme_rw_cb, req);
+        }
     } else {
         req->aiocb = blk_aio_pwrite_zeroes(blk, data_offset, data_size,
                                            BDRV_REQ_MAY_UNMAP, nvme_rw_cb,
@@ -3163,24 +3272,7 @@ static inline uint16_t nvme_write_zeroes(NvmeCtrl *n, NvmeRequest *req)
     return nvme_do_write(n, req, false, true);
 }
 
-typedef struct NvmeZoneCmdAIOCB {
-    NvmeRequest *req;
-    NvmeCmd *cmd;
-    NvmeCtrl *n;
-
-    union {
-        struct {
-          uint32_t partial;
-          unsigned int nr_zones;
-          BlockZoneDescriptor *zones;
-        } zone_report_data;
-        struct {
-          int64_t offset;
-        } zone_append_data;
-    };
-} NvmeZoneCmdAIOCB;
-
-static inline uint16_t nvme_zone_append(NvmeCtrl *n, NvmeRequest *req)
+static uint16_t nvme_zone_append(NvmeCtrl *n, NvmeRequest *req)
 {
     return nvme_do_write(n, req, true, false);
 }
