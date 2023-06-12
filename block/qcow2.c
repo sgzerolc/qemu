@@ -2198,7 +2198,7 @@ static void qcow2_refresh_limits(BlockDriverState *bs, Error **errp)
     bs->bl.max_active_zones = s->zoned_header.max_active_zones;
     bs->bl.max_open_zones = s->zoned_header.max_open_zones;
     bs->bl.zone_size = s->zoned_header.zone_size;
-    bs->bl.write_granularity = BDRV_SECTOR_SIZE;
+    bs->bl.write_granularity = 4096; /* physical block size */
 }
 
 static int qcow2_reopen_prepare(BDRVReopenState *state,
@@ -4915,6 +4915,11 @@ qcow2_co_zone_append(BlockDriverState *bs, int64_t *offset, QEMUIOVector *qiov,
     qemu_co_mutex_lock(&s->wps->colock);
     uint64_t wp = s->wps->wp[index];
     uint64_t wp_i = qcow2_get_wp(wp);
+    printf("qcow2 offset 0x%lx\n", *offset);
+    printf("checking wp[%ld]: 0b%lb\n", *offset / bs->bl.zone_size, wp);
+    for (int i = 0; i < bs->bl.nr_zones; i++) {
+        printf("Listing wp[%d]: 0b%lb\n", i, s->wps->wp[i]);
+    }
     ret = qcow2_co_pwritev_part(bs, wp_i, len, qiov, 0, 0);
     if (ret == 0) {
         *offset = wp_i;

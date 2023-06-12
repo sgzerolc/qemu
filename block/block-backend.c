@@ -2426,6 +2426,14 @@ uint32_t blk_get_nr_zones(BlockBackend *blk)
     return bs ? bs->bl.nr_zones : 0;
 }
 
+uint32_t blk_get_write_granularity(BlockBackend *blk)
+{
+    BlockDriverState *bs = blk_bs(blk);
+    IO_CODE();
+
+    return bs ? bs->bl.write_granularity : 0;
+}
+
 uint8_t *blk_get_zone_extension(BlockBackend *blk) {
     BlockDriverState * bs = blk_bs(blk);
     IO_CODE();
