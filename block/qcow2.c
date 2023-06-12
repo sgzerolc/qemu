@@ -2290,7 +2290,7 @@ static void qcow2_refresh_limits(BlockDriverState *bs, Error **errp)
     bs->bl.max_open_zones = s->zoned_header.max_open_zones;
     bs->bl.zone_size = s->zoned_header.zone_size;
     bs->bl.zone_capacity = s->zoned_header.zone_capacity;
-    bs->bl.write_granularity = BDRV_SECTOR_SIZE;
+    bs->bl.write_granularity = BDRV_SECTOR_SIZE; /* physical block size */
     bs->bl.zd_extension_size = s->zoned_header.zd_extension_size;
 }
 

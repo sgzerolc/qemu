@@ -274,6 +274,23 @@ BlockAIOCB *dma_blk_write(BlockBackend *blk,
                       DMA_DIRECTION_TO_DEVICE);
 }
 
+static
+BlockAIOCB *dma_blk_zone_append_io_func(int64_t offset, QEMUIOVector *iov,
+                                  BlockCompletionFunc *cb, void *cb_opaque,
+                                  void *opaque)
+{
+    BlockBackend *blk = opaque;
+    return blk_aio_zone_append(blk, (int64_t *)offset, iov, 0, cb, cb_opaque);
+}
+
+BlockAIOCB *dma_blk_zone_append(BlockBackend *blk,
+                          QEMUSGList *sg, int64_t offset, uint32_t align,
+                          void (*cb)(void *opaque, int ret), void *opaque)
+{
+    return dma_blk_io(blk_get_aio_context(blk), sg, offset, align,
+                      dma_blk_zone_append_io_func, blk, cb, opaque,
+                      DMA_DIRECTION_TO_DEVICE);
+}
 
 static MemTxResult dma_buf_rw(void *buf, dma_addr_t len, dma_addr_t *residual,
                               QEMUSGList *sg, DMADirection dir,
