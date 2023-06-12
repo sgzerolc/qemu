@@ -2402,6 +2402,8 @@ int blk_get_zone_info(BlockBackend *blk, const char *info)
         return bs->bl.zd_extension_size;
     } else if (g_strcmp0(info, "nr_zones")) {
         return bs->bl.nr_zones;
+    } else if (g_strcmp0(info, "write_granularity")) {
+        return bs->bl.write_granularity;
     } else {
         return 0;
     }
@@ -2413,6 +2415,14 @@ uint8_t *blk_get_zone_extension(BlockBackend *blk)
     IO_CODE();
 
     return bs ? bs->zd_extensions : NULL;
+}
+
+BlockZoneWps *blk_get_zone_wps(BlockBackend *blk)
+{
+    BlockDriverState *bs = blk_bs(blk);
+    IO_CODE();
+
+    return bs ? bs->wps : NULL;
 }
 
 void *blk_try_blockalign(BlockBackend *blk, size_t size)
