@@ -2208,7 +2208,7 @@ static void qcow2_refresh_limits(BlockDriverState *bs, Error **errp)
     bs->bl.max_active_zones = s->zoned_header.max_active_zones;
     bs->bl.max_open_zones = s->zoned_header.max_open_zones;
     bs->bl.zone_size = s->zoned_header.zone_size;
-    bs->bl.write_granularity = BDRV_SECTOR_SIZE;
+    bs->bl.write_granularity = 4096; /* physical block size, hardcoded it for now */
 }
 
 static int qcow2_reopen_prepare(BDRVReopenState *state,
@@ -2916,6 +2916,7 @@ qcow2_co_pwritev_part(BlockDriverState *bs, int64_t offset, int64_t bytes,
         index = start_offset / zone_size;
         wp = &s->wps->wp[index];
         if (offset < qcow2_get_wp(*wp)) {
+            printf("e1!\n");
             return -EINVAL;
         }
     }
@@ -2937,12 +2938,14 @@ qcow2_co_pwritev_part(BlockDriverState *bs, int64_t offset, int64_t bytes,
         ret = qcow2_alloc_host_offset(bs, offset, &cur_bytes,
                                       &host_offset, &l2meta);
         if (ret < 0) {
+            printf("e2");
             goto out_locked;
         }
 
         ret = qcow2_pre_write_overlap_check(bs, 0, host_offset,
                                             cur_bytes, true);
         if (ret < 0) {
+            printf("e3");
             goto out_locked;
         }
 
@@ -2956,6 +2959,7 @@ qcow2_co_pwritev_part(BlockDriverState *bs, int64_t offset, int64_t bytes,
                              cur_bytes, qiov, qiov_offset, l2meta);
         l2meta = NULL; /* l2meta is consumed by qcow2_co_pwritev_task() */
         if (ret < 0) {
+            printf("e4");
             goto fail_nometa;
         }
 
@@ -2978,6 +2982,7 @@ qcow2_co_pwritev_part(BlockDriverState *bs, int64_t offset, int64_t bytes,
             if (zs == BLK_ZS_CLOSED || zs == BLK_ZS_EMPTY) {
                 ret = qcow2_check_zone_resources(bs, zs);
                 if (ret < 0) {
+                    printf("e5");
                     goto fail_nometa;
                 }
 
@@ -2995,12 +3000,14 @@ qcow2_co_pwritev_part(BlockDriverState *bs, int64_t offset, int64_t bytes,
             if (start_offset + start_bytes <= end) {
                 *wp = start_offset + start_bytes;
             } else {
+                printf("e6");
                 ret = -EINVAL;
                 goto fail_nometa;
             }
 
             ret = qcow2_write_wp_at(bs, wp, index,BLK_ZS_IOPEN);
             if (ret < 0) {
+                printf("e7");
                 goto fail_nometa;
             }
         }
@@ -3025,6 +3032,7 @@ fail_nometa:
 
     trace_qcow2_writev_done_req(qemu_coroutine_self(), ret);
 
+    printf("b2");
     return ret;
 }
 
@@ -4837,6 +4845,7 @@ qcow2_co_zone_append(BlockDriverState *bs, int64_t *offset, QEMUIOVector *qiov,
     }
 
     int64_t wg = bs->bl.write_granularity;
+    printf("qcow2 wg 0x%lx\n", wg);
     int64_t wg_mask = wg - 1;
     for (int i = 0; i < qiov->niov; i++) {
         iov_len = qiov->iov[i].iov_len;
@@ -4855,6 +4864,11 @@ qcow2_co_zone_append(BlockDriverState *bs, int64_t *offset, QEMUIOVector *qiov,
     qemu_co_mutex_lock(&s->wps->colock);
     uint64_t wp = s->wps->wp[*offset / bs->bl.zone_size];
     uint64_t wp_i = qcow2_get_wp(wp);
+    printf("qcow2 offset 0x%lx\n", *offset);
+    printf("checking wp[%ld]: 0b%lb\n", *offset/bs->bl.zone_size, wp);
+    for (int i = 0; i < bs->bl.nr_zones; i++) {
+        printf("Listing wp[%d]: 0b%lb\n", i, s->wps->wp[i]);
+    }
     ret = qcow2_co_pwritev_part(bs, wp_i, len, qiov, 0, 0);
     if (ret == 0) {
         *offset = wp_i;
