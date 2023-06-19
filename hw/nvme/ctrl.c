@@ -2142,8 +2142,7 @@ static void nvme_blk_zone_append_complete_cb(void *opaque, int ret)
         nvme_aio_err(req, ret);
     }
 
-    printf("checking zap comp: 0x%lx\n", cb->zone_append_data.offset);
-    *offset = cpu_to_le64(cb->zone_append_data.offset);
+    *offset = cpu_to_le64(cb->zone_append_data.offset >> BDRV_SECTOR_BITS);
     nvme_enqueue_req_completion(nvme_cq(req), req);
     g_free(cb);
 }
