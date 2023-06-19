@@ -295,7 +295,6 @@ BlockAIOCB *dma_blk_zone_append(BlockBackend *blk,
                           QEMUSGList *sg, int64_t offset, uint32_t align,
                           void (*cb)(void *opaque, int ret), void *opaque)
 {
-    printf("dma zap 0x%lx\n", offset);
     return dma_blk_io(blk_get_aio_context(blk), sg, offset, align,
                       dma_blk_zone_append_io_func, blk, cb, opaque,
                       DMA_DIRECTION_TO_DEVICE);

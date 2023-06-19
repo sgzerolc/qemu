@@ -2916,7 +2916,6 @@ qcow2_co_pwritev_part(BlockDriverState *bs, int64_t offset, int64_t bytes,
         index = start_offset / zone_size;
         wp = &s->wps->wp[index];
         if (offset < qcow2_get_wp(*wp)) {
-            printf("e1!\n");
             return -EINVAL;
         }
     }
@@ -2938,14 +2937,12 @@ qcow2_co_pwritev_part(BlockDriverState *bs, int64_t offset, int64_t bytes,
         ret = qcow2_alloc_host_offset(bs, offset, &cur_bytes,
                                       &host_offset, &l2meta);
         if (ret < 0) {
-            printf("e2");
             goto out_locked;
         }
 
         ret = qcow2_pre_write_overlap_check(bs, 0, host_offset,
                                             cur_bytes, true);
         if (ret < 0) {
-            printf("e3");
             goto out_locked;
         }
 
@@ -2959,7 +2956,6 @@ qcow2_co_pwritev_part(BlockDriverState *bs, int64_t offset, int64_t bytes,
                              cur_bytes, qiov, qiov_offset, l2meta);
         l2meta = NULL; /* l2meta is consumed by qcow2_co_pwritev_task() */
         if (ret < 0) {
-            printf("e4");
             goto fail_nometa;
         }
 
@@ -2982,7 +2978,6 @@ qcow2_co_pwritev_part(BlockDriverState *bs, int64_t offset, int64_t bytes,
             if (zs == BLK_ZS_CLOSED || zs == BLK_ZS_EMPTY) {
                 ret = qcow2_check_zone_resources(bs, zs);
                 if (ret < 0) {
-                    printf("e5");
                     goto fail_nometa;
                 }
 
@@ -3000,14 +2995,12 @@ qcow2_co_pwritev_part(BlockDriverState *bs, int64_t offset, int64_t bytes,
             if (start_offset + start_bytes <= end) {
                 *wp = start_offset + start_bytes;
             } else {
-                printf("e6");
                 ret = -EINVAL;
                 goto fail_nometa;
             }
 
             ret = qcow2_write_wp_at(bs, wp, index,BLK_ZS_IOPEN);
             if (ret < 0) {
-                printf("e7");
                 goto fail_nometa;
             }
         }
@@ -3032,7 +3025,6 @@ fail_nometa:
 
     trace_qcow2_writev_done_req(qemu_coroutine_self(), ret);
 
-    printf("b2");
     return ret;
 }
 

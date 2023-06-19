@@ -2134,7 +2134,6 @@ typedef struct NvmeZoneCmdAIOCB {
 
 static void nvme_blk_zone_append_complete_cb(void *opaque, int ret)
 {
-    printf("zap comp\n");
     NvmeZoneCmdAIOCB *cb = opaque;
     NvmeRequest *req = cb->req;
     int64_t *offset = (int64_t *)&req->cqe;
@@ -2143,8 +2142,8 @@ static void nvme_blk_zone_append_complete_cb(void *opaque, int ret)
         nvme_aio_err(req, ret);
     }
 
+    printf("checking zap comp: 0x%lx\n", cb->zone_append_data.offset);
     *offset = cpu_to_le64(cb->zone_append_data.offset);
-    printf("enqueue\n");
     nvme_enqueue_req_completion(nvme_cq(req), req);
     g_free(cb);
 }
@@ -2160,10 +2159,10 @@ static inline void nvme_blk_zone_append(BlockBackend *blk, int64_t offset,
     if (req->sg.flags & NVME_SG_DMA) {
         printf("call dma zap: offset 0x%lx\n", offset);
         req->aiocb = dma_blk_zone_append(blk, &req->sg.qsg, offset, align,
-                                         cb, req);
+                                         cb, aiocb);
     } else {
         printf("call zap: offset 0x%lx\n", offset);
-        req->aiocb = blk_aio_zone_append(blk, &offset, &req->sg.iov, 0, cb, req);
+        req->aiocb = blk_aio_zone_append(blk, &offset, &req->sg.iov, 0, cb, aiocb);
     }
 }
 
@@ -2197,6 +2196,7 @@ static void nvme_zone_append_cb(void *opaque, int ret)
                 goto out;
             }
 
+            printf("zap cb\n");
             return nvme_blk_zone_append(blk, offset, 1,
                                         nvme_blk_zone_append_complete_cb,
                                         aiocb);
