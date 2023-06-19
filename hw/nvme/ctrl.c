@@ -2147,7 +2147,7 @@ static void nvme_blk_zone_append_complete_cb(void *opaque, int ret)
     g_free(cb);
 }
 
-static inline void nvme_blk_zone_append(BlockBackend *blk, int64_t offset,
+static inline void nvme_blk_zone_append(BlockBackend *blk, int64_t *offset,
                                   uint32_t align,
                                   BlockCompletionFunc *cb,
                                   NvmeZoneCmdAIOCB *aiocb)
@@ -2156,12 +2156,12 @@ static inline void nvme_blk_zone_append(BlockBackend *blk, int64_t offset,
     assert(req->sg.flags & NVME_SG_ALLOC);
 
     if (req->sg.flags & NVME_SG_DMA) {
-        printf("call dma zap: offset 0x%lx\n", offset);
-        req->aiocb = dma_blk_zone_append(blk, &req->sg.qsg, offset, align,
+        printf("call dma zap: offset 0x%lx\n", *offset);
+        req->aiocb = dma_blk_zone_append(blk, &req->sg.qsg, (int64_t)offset, align,
                                          cb, aiocb);
     } else {
-        printf("call zap: offset 0x%lx\n", offset);
-        req->aiocb = blk_aio_zone_append(blk, &offset, &req->sg.iov, 0, cb, aiocb);
+        printf("call zap: offset 0x%lx\n", *offset);
+        req->aiocb = blk_aio_zone_append(blk, offset, &req->sg.iov, 0, cb, aiocb);
     }
 }
 
@@ -2181,9 +2181,8 @@ static void nvme_zone_append_cb(void *opaque, int ret)
 
     if (ns->lbaf.ms) {
         NvmeRwCmd *rw = (NvmeRwCmd *)&req->cmd;
-        uint64_t slba = le64_to_cpu(rw->slba);
         uint32_t nlb = (uint32_t)le16_to_cpu(rw->nlb) + 1;
-        uint64_t offset = nvme_moff(ns, slba);
+        int64_t offset = aiocb->zone_append_data.offset;
 
         if (nvme_ns_ext(ns) || req->cmd.mptr) {
             uint16_t status;
@@ -2195,8 +2194,7 @@ static void nvme_zone_append_cb(void *opaque, int ret)
                 goto out;
             }
 
-            printf("zap cb\n");
-            return nvme_blk_zone_append(blk, offset, 1,
+            return nvme_blk_zone_append(blk, &offset, 1,
                                         nvme_blk_zone_append_complete_cb,
                                         aiocb);
         }
@@ -3625,8 +3623,6 @@ static uint16_t nvme_do_write(NvmeCtrl *n, NvmeRequest *req, bool append,
         assert(wps);
         zone_idx = slba / bs->bl.zone_size;
         int64_t zone_start = zone_idx * bs->bl.zone_size;
-        uint64_t *wp = &wps->wp[zone_idx];
-        printf("original slba 0x%lx\n", slba);
 
         if (append) {
             bool piremap = !!(ctrl & NVME_RW_PIREMAP);
@@ -3641,7 +3637,6 @@ static uint16_t nvme_do_write(NvmeCtrl *n, NvmeRequest *req, bool append,
                 return NVME_INVALID_FIELD | NVME_DNR;
             }
 
-            slba = *wp;
             rw->slba = cpu_to_le64(slba);
 
             switch (NVME_ID_NS_DPS_TYPE(ns->id_ns.dps)) {
@@ -3699,7 +3694,6 @@ static uint16_t nvme_do_write(NvmeCtrl *n, NvmeRequest *req, bool append,
         }
 
         if (append) {
-            data_offset /= 512;
             printf("zns slba <sector> 0x%lx\n", data_offset);
 
             NvmeZoneCmdAIOCB *cb = g_malloc(sizeof(NvmeZoneCmdAIOCB));
@@ -3708,7 +3702,8 @@ static uint16_t nvme_do_write(NvmeCtrl *n, NvmeRequest *req, bool append,
 
             block_acct_start(blk_get_stats(blk), &req->acct, data_size,
                              BLOCK_ACCT_ZONE_APPEND);
-            nvme_blk_zone_append(blk, data_offset, bs->bl.write_granularity,
+            nvme_blk_zone_append(blk, &cb->zone_append_data.offset,
+                                 bs->bl.write_granularity,
                                  nvme_zone_append_cb, cb);
         } else {
             block_acct_start(blk_get_stats(blk), &req->acct, data_size,
@@ -4107,14 +4102,13 @@ static uint16_t nvme_zone_mgmt_send(NvmeCtrl *n, NvmeRequest *req)
 //    uint8_t *zd_ext;
     uint64_t slba = 0;
     uint64_t offset;
+    int64_t len;
     uint32_t zone_idx = 0;
     uint16_t status;
     uint8_t action = cmd->zsa;
     BlockZoneOp op;
     bool all;
 //    enum NvmeZoneProcessingMask proc_mask = NVME_PROC_CURRENT_ZONE;
-
-    printf("send");
 
     all = cmd->zsflags & NVME_ZSFLAG_SELECT_ALL;
 
@@ -4125,6 +4119,9 @@ static uint16_t nvme_zone_mgmt_send(NvmeCtrl *n, NvmeRequest *req)
         if (status) {
             return status;
         }
+        len = bs->bl.zone_size;
+    } else {
+        len = bs->total_sectors << BDRV_SECTOR_BITS;
     }
 
 //    if (slba != zone->d.start && action != NVME_ZONE_ACTION_ZRWA_FLUSH) {
@@ -4205,7 +4202,7 @@ static uint16_t nvme_zone_mgmt_send(NvmeCtrl *n, NvmeRequest *req)
 
     if (op != BLK_ZO_INVALID) {
         offset = slba << BDRV_SECTOR_BITS;
-        blk_aio_zone_mgmt(blk, op, offset, bs->bl.zone_size,
+        blk_aio_zone_mgmt(blk, op, offset, len,
                           nvme_zone_mgmt_send_completed_cb, req);
     }
 
@@ -4224,7 +4221,6 @@ static bool nvme_zone_matches_filter(uint32_t zafs, BlockZoneState zs)
 {
     switch (zafs) {
     case NVME_ZONE_REPORT_ALL:
-        printf(":)");
         return true;
     case NVME_ZONE_REPORT_EMPTY:
         return zs == BLK_ZS_EMPTY;
@@ -4271,7 +4267,6 @@ static void nvme_zone_mgmt_recv_completed_cb(void *opaque, int ret)
         return;
     }
 
-    printf("combo zrasf 0x%x\n", zrasf);
     zrp_size = sizeof(NvmeZoneReportHeader) + sizeof(NvmeZoneDescr) * nz;
     buf = g_malloc0(zrp_size);
 
@@ -4317,7 +4312,6 @@ static void nvme_zone_mgmt_recv_completed_cb(void *opaque, int ret)
             break;
         case BLK_ZS_EMPTY:
             out_zone->zs = NVME_ZONE_STATE_EMPTY << 4;
-//            printf("zs 0b%b\n", out_zone->zs);
             break;
         case BLK_ZS_CLOSED:
             out_zone->zs = NVME_ZONE_STATE_CLOSED << 4;
@@ -4332,19 +4326,14 @@ static void nvme_zone_mgmt_recv_completed_cb(void *opaque, int ret)
             out_zone->zs = NVME_ZONE_STATE_IMPLICITLY_OPEN << 4;
             break;
         case BLK_ZS_NOT_WP:
-            printf("..:<..");
             out_zone->zs = NVME_ZONE_STATE_RESERVED << 4;
             break;
         default:
             g_assert_not_reached();
         }
-//        printf("out_zone [%ld]: zslba 0x%lx\n", j, out_zone->zslba);
     }
 
     nvme_c2h(iocb->n, (uint8_t *)buf, zrp_size, req);
-    printf("zrp_size 0x%lx, 0x%lx\n", zrp_size,
-           iocb->zone_report_data.nr_zones * sizeof(NvmeZoneDescr)
-           + sizeof(NvmeZoneReportHeader));
 
 out:
     g_free(iocb->zone_report_data.zones);
@@ -4366,7 +4355,6 @@ static uint16_t nvme_zone_mgmt_recv(NvmeCtrl *n, NvmeRequest *req)
     uint64_t slba;
     size_t zone_entry_sz;
     int64_t offset;
-    printf("recv sending: data_size 0x%x\n", data_size);
     req->status = NVME_SUCCESS;
 
     status = nvme_get_mgmt_zone_slba_idx(ns, cmd, &slba, &zone_idx);
@@ -4411,7 +4399,6 @@ static uint16_t nvme_zone_mgmt_recv(NvmeCtrl *n, NvmeRequest *req)
     iocb->zone_report_data.zones = g_malloc0(
             sizeof(BlockZoneDescriptor) * nr_zones);
 
-    printf("offset 0x%lx, nrz: %d\n", offset, nr_zones);
     blk_aio_zone_report(blk, offset,
                         &iocb->zone_report_data.nr_zones,
                         iocb->zone_report_data.zones,

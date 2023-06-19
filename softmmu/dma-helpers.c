@@ -288,7 +288,7 @@ BlockAIOCB *dma_blk_zone_append_io_func(int64_t offset, QEMUIOVector *iov,
                                   void *opaque)
 {
     BlockBackend *blk = opaque;
-    return blk_aio_zone_append(blk, &offset, iov, 0, cb, cb_opaque);
+    return blk_aio_zone_append(blk, (int64_t *)offset, iov, 0, cb, cb_opaque);
 }
 
 BlockAIOCB *dma_blk_zone_append(BlockBackend *blk,
