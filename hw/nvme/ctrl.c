@@ -4387,7 +4387,7 @@ static uint16_t nvme_zone_mgmt_recv(NvmeCtrl *n, NvmeRequest *req)
     offset = nvme_l2b(ns, slba);
     nr_zones = (data_size - sizeof(NvmeZoneReportHeader)) / zone_entry_sz;
     partial = (dw13 >> 16) & 0x01;
-    if (partial) {
+    if (!partial) {
         nr_zones = blk_bs(blk)->bl.nr_zones;
         offset = 0;
     }

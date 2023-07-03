@@ -673,7 +673,6 @@ int nvme_ns_setup(NvmeNamespace *ns, Error **errp)
         }
         nvme_ns_init_zoned(ns);
     }
-    printf("zone type: 0x%x\n", ns->zone_array[0].d.type);
 
     if (ns->endgrp && ns->endgrp->fdp.enabled) {
         if (!nvme_ns_init_fdp(ns, errp)) {
