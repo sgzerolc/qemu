@@ -225,10 +225,10 @@ typedef struct NvmeNamespace {
 
     NvmeIdNsZoned   *id_ns_zoned;
     NvmeZone        *zone_array;
-    QTAILQ_HEAD(, NvmeZone) exp_open_zones;
-    QTAILQ_HEAD(, NvmeZone) imp_open_zones;
-    QTAILQ_HEAD(, NvmeZone) closed_zones;
-    QTAILQ_HEAD(, NvmeZone) full_zones;
+    uint32_t        *exp_open_zones;
+    uint32_t        *imp_open_zones;
+    uint32_t        *closed_zones;
+    uint32_t        *full_zones;
     uint32_t        num_zones;
     uint64_t        zone_size;
     uint64_t        zone_capacity;
