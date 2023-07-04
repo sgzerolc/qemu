@@ -1782,7 +1782,7 @@ static void nvme_blk_zone_append_complete_cb(void *opaque, int ret)
         nvme_aio_err(req, ret);
     }
 
-    *offset = cpu_to_le64(cb->zone_append_data.offset >> BDRV_SECTOR_BITS);
+    *offset = nvme_b2l(req->ns, cb->zone_append_data.offset);
     nvme_enqueue_req_completion(nvme_cq(req), req);
     g_free(cb);
 }
@@ -3556,7 +3556,8 @@ static uint16_t nvme_zone_mgmt_send(NvmeCtrl *n, NvmeRequest *req)
     }
 
     if (op != BLK_ZO_INVALID) {
-        offset = slba << BDRV_SECTOR_BITS;
+        offset = nvme_l2b(ns, slba);
+        printf("mgmt off: 0x%lx\n", offset);
         blk_aio_zone_mgmt(blk, op, offset, len,
                           nvme_zone_mgmt_send_completed_cb, req);
     }
@@ -3639,9 +3640,9 @@ static void nvme_zone_mgmt_recv_completed_cb(void *opaque, int ret)
         }
 
         *out_zone = (NvmeZoneDescr) {
-            .zslba = cpu_to_le64(in_zone[j].start >> BDRV_SECTOR_BITS),
-            .zcap = cpu_to_le64(in_zone[j].cap >> BDRV_SECTOR_BITS),
-            .wp = cpu_to_le64(in_zone[j].wp >> BDRV_SECTOR_BITS),
+            .zslba = nvme_b2l(req->ns, in_zone[j].start),
+            .zcap = nvme_b2l(req->ns, in_zone[j].cap),
+            .wp = nvme_b2l(req->ns, in_zone[j].wp),
         };
 
         switch (in_zone[j].type) {
