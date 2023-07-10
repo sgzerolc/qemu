@@ -3474,6 +3474,7 @@ static uint16_t nvme_zone_mgmt_send(NvmeCtrl *n, NvmeRequest *req)
         break;
 
     case NVME_ZONE_ACTION_SET_ZD_EXT:
+        op = BLK_ZO_SET_ZDED;
         int zd_ext_size = blk_get_zd_ext_size(blk);
         trace_pci_nvme_set_descriptor_extension(slba, zone_idx);
         if (all || !zd_ext_size) {
