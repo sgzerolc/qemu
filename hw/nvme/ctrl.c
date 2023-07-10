@@ -3354,6 +3354,7 @@ static uint16_t nvme_zone_mgmt_send(NvmeCtrl *n, NvmeRequest *req)
     NvmeZoneSendCmd *cmd = (NvmeZoneSendCmd *)&req->cmd;
     NvmeNamespace *ns = req->ns;
     BlockBackend *blk = ns->blkconf.blk;
+    uint8_t *zd_ext;
     uint64_t slba = 0;
     uint64_t offset;
     uint32_t zone_size = blk_get_zone_info(blk, "zone_size");
@@ -3402,10 +3403,20 @@ static uint16_t nvme_zone_mgmt_send(NvmeCtrl *n, NvmeRequest *req)
         trace_pci_nvme_offline_zone(slba, zone_idx, all);
         break;
     case NVME_ZONE_ACTION_SET_ZD_EXT:
-        op = BLK_ZO_INVALID;
+        op = BLK_ZO_SET_ZDED;
+        int zd_ext_size = blk_get_zone_info(blk, "zd_ext_size");
         trace_pci_nvme_set_descriptor_extension(slba, zone_idx);
+        if (all || !zd_ext_size) {
+            return NVME_INVALID_FIELD | NVME_DNR;
+        }
+        zd_ext = nvme_get_zd_extension(ns, zone_idx);
+        status = nvme_h2c(n, zd_ext, zd_ext_size, req);
+        if (status) {
+            trace_pci_nvme_err_zd_extension_map_error(zone_idx);
+            return status;
+        }
+        trace_pci_nvme_zd_extension_set(zone_idx);
         break;
-
     case NVME_ZONE_ACTION_ZRWA_FLUSH:
         op = BLK_ZO_INVALID;
         break;
