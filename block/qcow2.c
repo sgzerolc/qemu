@@ -25,6 +25,7 @@
 #include "qemu/osdep.h"
 
 #include "block/qdict.h"
+#include "block/nvme.h"
 #include "sysemu/block-backend.h"
 #include "qemu/main-loop.h"
 #include "qemu/module.h"
@@ -226,6 +227,17 @@ static inline BlockZoneState qcow2_get_zs(BlockDriverState *bs,
     } else {
         return BLK_ZS_NOT_WP;
     }
+}
+
+static inline void qcow2_set_za(uint64_t *wp, uint8_t za)
+{
+    /*
+     * The zone attribute takes up one byte. Store it after the zoned
+     * bit.
+     */
+    uint64_t addr = *wp;
+    addr |= ((uint64_t)za << 51);
+    *wp = addr;
 }
 
 /*
@@ -4882,6 +4894,33 @@ unlock:
     return ret;
 }
 
+static int qcow2_zns_set_zded(BlockDriverState *bs, uint32_t index)
+{
+    BDRVQcow2State *s = bs->opaque;
+    int ret;
+
+    qemu_co_mutex_lock(&s->wps->colock);
+    uint64_t *wp = &s->wps->wp[index];
+    BlockZoneState zs = qcow2_get_zs(*wp);
+    if (zs == BLK_ZS_EMPTY) {
+        ret = qcow2_check_zone_resources(bs, zs);
+        if (ret < 0) {
+            return ret;
+        }
+
+        qcow2_set_za(wp, NVME_ZA_ZD_EXT_VALID);
+        ret = qcow2_write_wp_at(bs, wp, index, BLK_ZO_CLOSE);
+        if (ret < 0) {
+            error_report("Failed to set zone extension at 0x%" PRIx64 "", *wp);
+            return ret;
+        }
+        s->nr_zones_closed++;
+        return ret;
+    }
+
+    return NVME_ZONE_INVAL_TRANSITION;
+}
+
 static int coroutine_fn qcow2_co_zone_mgmt(BlockDriverState *bs, BlockZoneOp op,
                                            int64_t offset, int64_t len)
 {
@@ -4937,6 +4976,9 @@ static int coroutine_fn qcow2_co_zone_mgmt(BlockDriverState *bs, BlockZoneOp op,
         break;
     case BLK_ZO_OFFLINE:
         /* There are no transitions from the offline state to any other state */
+        break;
+    case BLK_ZO_SET_ZDED:
+        ret = qcow2_zns_set_zded(bs, index);
         break;
     default:
         error_report("Unsupported zone op: 0x%x", op);
