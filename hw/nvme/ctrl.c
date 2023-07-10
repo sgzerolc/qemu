@@ -3425,11 +3425,6 @@ static uint16_t nvme_zone_mgmt_send(NvmeCtrl *n, NvmeRequest *req)
     NvmeNamespace *ns = req->ns;
     NvmeZoneMgmtAIOCB *iocb;
     uint64_t slba = 0;
-    uint64_t offset;
-    BlockBackend *blk = ns->blkconf.blk;
-    uint32_t zone_size = blk_get_zone_size(blk);
-    uint64_t size = zone_size * blk_get_nr_zones(blk);
-    int64_t len;
     uint32_t zone_idx = 0;
     uint16_t status;
     uint8_t action = cmd->zsa;
@@ -3485,6 +3480,7 @@ static uint16_t nvme_zone_mgmt_send(NvmeCtrl *n, NvmeRequest *req)
         break;
 
     case NVME_ZONE_ACTION_SET_ZD_EXT:
+        op = BLK_ZO_SET_ZDED;
         int zd_ext_size = blk_get_zd_ext_size(blk);
         trace_pci_nvme_set_descriptor_extension(slba, zone_idx);
         if (all || !zd_ext_size) {
