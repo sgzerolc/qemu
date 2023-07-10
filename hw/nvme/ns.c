@@ -228,9 +228,11 @@ static int nvme_ns_zoned_check_calc_geometry(NvmeNamespace *ns, Error **errp)
 
 static void nvme_ns_zoned_init_state(NvmeNamespace *ns)
 {
-    if (ns->params.zd_extension_size) {
-        ns->zd_extensions = g_malloc0(ns->params.zd_extension_size *
-                                      ns->num_zones);
+    BlockDriverState *bs = blk_bs(ns->blkconf.blk);
+
+    if (bs->bl.zd_extension_size > 0) {
+        ns->zd_extensions = g_malloc0(bs->bl.zd_extension_size *
+            ns->num_zones);
     }
 
     /* Store the zone_idx of the specific states at ? */
@@ -261,7 +263,7 @@ static void nvme_ns_init_zoned(NvmeNamespace *ns)
     for (i = 0; i <= ns->id_ns.nlbaf; i++) {
         id_ns_z->lbafe[i].zsze = cpu_to_le64(ns->zone_size);
         id_ns_z->lbafe[i].zdes =
-            ns->params.zd_extension_size >> 6; /* Units of 64B */
+            bs->bl.zd_extension_size >> 6; /* Units of 64B */
     }
 
     if (ns->params.zrwas) {
@@ -532,13 +534,13 @@ static int nvme_ns_check_constraints(NvmeNamespace *ns, Error **errp)
             }
         }
 
-        if (ns->params.zd_extension_size) {
-            if (ns->params.zd_extension_size & 0x3f) {
+        if (bs->bl.zd_extension_size > 0) {
+            if (bs->bl.zd_extension_size & 0x3f) {
                 error_setg(errp, "zone descriptor extension size must be a "
                            "multiple of 64B");
                 return -1;
             }
-            if ((ns->params.zd_extension_size >> 6) > 0xff) {
+            if ((bs->bl.zd_extension_size >> 6) > 0xff) {
                 error_setg(errp,
                            "zone descriptor extension size is too large");
                 return -1;

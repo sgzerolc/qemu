@@ -291,75 +291,10 @@ static inline NvmeZoneState nvme_get_zone_state(uint64_t wp)
     return wp >> 60;
 }
 
-static inline void nvme_set_zone_state(NvmeZone *zone, NvmeZoneState state)
-{
-    zone->d.state = state << 4;
-}
-
-static inline uint64_t nvme_zone_rd_boundary(NvmeNamespace *ns, NvmeZone *zone)
-{
-    return zone->d.start + ns->zone_size;
-}
-
-static inline uint64_t nvme_zone_wr_boundary(NvmeZone *zone)
-{
-    return zone->d.start + zone->d.cap;
-}
-
-//static inline bool nvme_wp_is_valid(NvmeZone *zone)
-//{
-//    uint8_t st = nvme_get_zone_state(zone);
-//
-//    return st != NVME_ZONE_STATE_FULL &&
-//           st != NVME_ZONE_STATE_READ_ONLY &&
-//           st != NVME_ZONE_STATE_OFFLINE;
-//}
-
-static inline uint8_t *nvme_get_zd_extension(NvmeNamespace *ns,
+static inline uint8_t *nvme_get_zd_extension(BlockDriverState *bs,
                                              uint32_t zone_idx)
 {
-    return &ns->zd_extensions[zone_idx * ns->params.zd_extension_size];
-}
-
-static inline void nvme_aor_inc_open(NvmeNamespace *ns,
-                                     BlockDriverState *bs)
-{
-    assert(ns->nr_open_zones >= 0);
-    if (bs->bl.max_open_zones) {
-        ns->nr_open_zones++;
-        assert(ns->nr_open_zones <= bs->bl.max_open_zones);
-    }
-}
-
-static inline void nvme_aor_dec_open(NvmeNamespace *ns,
-                                     BlockDriverState *bs)
-{
-    if (bs->bl.max_open_zones) {
-        assert(ns->nr_open_zones > 0);
-        ns->nr_open_zones--;
-    }
-    assert(ns->nr_open_zones >= 0);
-}
-
-static inline void nvme_aor_inc_active(NvmeNamespace *ns,
-                                       BlockDriverState *bs)
-{
-    assert(ns->nr_active_zones >= 0);
-    if (bs->bl.max_active_zones) {
-        ns->nr_active_zones++;
-        assert(ns->nr_active_zones <= bs->bl.max_active_zones);
-    }
-}
-
-static inline void nvme_aor_dec_active(NvmeNamespace *ns,
-                                       BlockDriverState *bs)
-{
-    if (bs->bl.max_active_zones) {
-        assert(ns->nr_active_zones > 0);
-        ns->nr_active_zones--;
-        assert(ns->nr_active_zones >= ns->nr_open_zones);
-    }
-    assert(ns->nr_active_zones >= 0);
+    return &bs->zd_extensions[zone_idx * bs->bl.zd_extension_size];
 }
 
 static inline void nvme_fdp_stat_inc(uint64_t *a, uint64_t b)

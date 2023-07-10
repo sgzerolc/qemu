@@ -3473,6 +3473,7 @@ static uint16_t nvme_zone_mgmt_send(NvmeCtrl *n, NvmeRequest *req)
     NvmeNamespace *ns = req->ns;
     BlockBackend *blk = ns->blkconf.blk;
     BlockDriverState *bs = blk_bs(blk);
+    uint8_t *zd_ext;
     uint64_t slba = 0;
     uint64_t offset;
     int64_t len;
@@ -3496,11 +3497,6 @@ static uint16_t nvme_zone_mgmt_send(NvmeCtrl *n, NvmeRequest *req)
         len = bs->total_sectors << BDRV_SECTOR_BITS;
     }
 
-//    if (slba != zone->d.start && action != NVME_ZONE_ACTION_ZRWA_FLUSH) {
-//        trace_pci_nvme_err_unaligned_zone_cmd(action, slba, zone->d.start);
-//        return NVME_INVALID_FIELD | NVME_DNR;
-//    }
-
     switch (action) {
     case NVME_ZONE_ACTION_OPEN:
         op = BLK_ZO_OPEN;
@@ -3523,25 +3519,19 @@ static uint16_t nvme_zone_mgmt_send(NvmeCtrl *n, NvmeRequest *req)
         trace_pci_nvme_offline_zone(slba, zone_idx, all);
         break;
     case NVME_ZONE_ACTION_SET_ZD_EXT:
-        op = BLK_ZO_INVALID;
+        op = BLK_ZO_SET_ZDED;
         trace_pci_nvme_set_descriptor_extension(slba, zone_idx);
-//        if (all || !ns->params.zd_extension_size) {
-//            return NVME_INVALID_FIELD | NVME_DNR;
-//        }
-//        zd_ext = nvme_get_zd_extension(ns, zone_idx);
-//        status = nvme_h2c(n, zd_ext, ns->params.zd_extension_size, req);
-//        if (status) {
-//            trace_pci_nvme_err_zd_extension_map_error(zone_idx);
-//            return status;
-//        }
-//
-//        status = nvme_set_zd_ext(ns, zone);
-//        if (status == NVME_SUCCESS) {
-//            trace_pci_nvme_zd_extension_set(zone_idx);
-//            return status;
-//        }
+        if (all || !bs->bl.zd_extension_size) {
+            return NVME_INVALID_FIELD | NVME_DNR;
+        }
+        zd_ext = nvme_get_zd_extension(bs, zone_idx);
+        status = nvme_h2c(n, zd_ext, bs->bl.zd_extension_size, req);
+        if (status) {
+            trace_pci_nvme_err_zd_extension_map_error(zone_idx);
+            return status;
+        }
+        trace_pci_nvme_zd_extension_set(zone_idx);
         break;
-
     case NVME_ZONE_ACTION_ZRWA_FLUSH:
         op = BLK_ZO_INVALID;
         break;
@@ -3559,7 +3549,6 @@ static uint16_t nvme_zone_mgmt_send(NvmeCtrl *n, NvmeRequest *req)
 
     if (op != BLK_ZO_INVALID) {
         offset = nvme_l2b(ns, slba);
-        printf("mgmt off: 0x%lx\n", offset);
         blk_aio_zone_mgmt(blk, op, offset, len,
                           nvme_zone_mgmt_send_completed_cb, req);
     }
