@@ -3373,88 +3373,38 @@ enum NvmeZoneProcessingMask {
     NVME_PROC_FULL_ZONES      = 1 << 3,
 };
 
-//static uint16_t nvme_bulk_proc_zone(NvmeNamespace *ns, NvmeZone *zone,
-//                                    enum NvmeZoneProcessingMask proc_mask,
-//                                    op_handler_t op_hndlr, NvmeRequest *req)
-//}
+static uint16_t nvme_zone_mgmt_send_zrwa_flush(NvmeCtrl *n, uint32_t zidx,
+                                               uint64_t elba, NvmeRequest *req)
+{
+    NvmeNamespace *ns = req->ns;
+    BlockDriverState *bs = blk_bs(ns->blkconf.blk);
+    uint16_t ozcs = le16_to_cpu(ns->id_ns_zoned->ozcs);
+    uint64_t *wp = &bs->wps->wp[zidx];
+    uint64_t raw_wpv = BDRV_ZP_GET_WP(*wp);
+    uint8_t za = BDRV_ZP_GET_ZA(raw_wpv);
+    uint64_t wpv = BDRV_ZP_GET_WP(raw_wpv);
+    uint32_t nlb = elba - wpv + 1;
 
-//static uint16_t nvme_do_zone_op(NvmeNamespace *ns, NvmeZone *zone,
-//                                enum NvmeZoneProcessingMask proc_mask,
-//                                op_handler_t op_hndlr, NvmeRequest *req)
+    if (!(ozcs & NVME_ID_NS_ZONED_OZCS_ZRWASUP)) {
+        return NVME_INVALID_ZONE_OP | NVME_DNR;
+    }
 
-//typedef struct NvmeZoneResetAIOCB {
-//    BlockAIOCB common;
-//    BlockAIOCB *aiocb;
-//    NvmeRequest *req;
-//    int ret;
-//
-//    bool all;
-//    int idx;
-//    NvmeZone *zone;
-//} NvmeZoneResetAIOCB;
-//
-//static void nvme_zone_reset_cancel(BlockAIOCB *aiocb)
-//{
-//    NvmeZoneResetAIOCB *iocb = container_of(aiocb, NvmeZoneResetAIOCB, common);
-//    NvmeRequest *req = iocb->req;
-//    NvmeNamespace *ns = req->ns;
-//
-//    iocb->idx = ns->num_zones;
-//
-//    iocb->ret = -ECANCELED;
-//
-//    if (iocb->aiocb) {
-//        blk_aio_cancel_async(iocb->aiocb);
-//        iocb->aiocb = NULL;
-//    }
-//}
-//
-//static const AIOCBInfo nvme_zone_reset_aiocb_info = {
-//    .aiocb_size = sizeof(NvmeZoneResetAIOCB),
-//    .cancel_async = nvme_zone_reset_cancel,
-//};
-//
-//static void nvme_zone_reset_cb(void *opaque, int ret);
-//
-//static void nvme_zone_reset_epilogue_cb(void *opaque, int ret)
-//
-//static uint16_t nvme_zone_mgmt_send_zrwa_flush(NvmeCtrl *n, NvmeZone *zone,
-//                                               uint64_t elba, NvmeRequest *req)
-//{
-//    NvmeNamespace *ns = req->ns;
-//    uint16_t ozcs = le16_to_cpu(ns->id_ns_zoned->ozcs);
-//    uint64_t wp = zone->d.wp;
-//    uint32_t nlb = elba - wp + 1;
-//    uint16_t status;
-//
-//
-//    if (!(ozcs & NVME_ID_NS_ZONED_OZCS_ZRWASUP)) {
-//        return NVME_INVALID_ZONE_OP | NVME_DNR;
-//    }
-//
-//    if (!(zone->d.za & NVME_ZA_ZRWA_VALID)) {
-//        return NVME_INVALID_FIELD | NVME_DNR;
-//    }
-//
-//    if (elba < wp || elba > wp + ns->zns.zrwas) {
-//        return NVME_ZONE_BOUNDARY_ERROR | NVME_DNR;
-//    }
-//
-//    if (nlb % ns->zns.zrwafg) {
-//        return NVME_INVALID_FIELD | NVME_DNR;
-//    }
-//
-//    status = nvme_zrm_auto(n, ns, zone);
-//    if (status) {
-//        return status;
-//    }
-//
-//    zone->w_ptr += nlb;
-//
-//    nvme_advance_zone_wp(ns, zone, nlb);
-//
-//    return NVME_SUCCESS;
-//}
+    if (!(za & NVME_ZA_ZRWA_VALID)) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+
+    if (elba < wpv || elba > wpv + ns->zns.zrwas) {
+        return NVME_ZONE_BOUNDARY_ERROR | NVME_DNR;
+    }
+
+    if (nlb % ns->zns.zrwafg) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+
+    *wp += nlb;
+
+    return NVME_SUCCESS;
+}
 
 static void nvme_zone_mgmt_send_completed_cb(void *opaque, int ret)
 {
@@ -3533,13 +3483,11 @@ static uint16_t nvme_zone_mgmt_send(NvmeCtrl *n, NvmeRequest *req)
         trace_pci_nvme_zd_extension_set(zone_idx);
         break;
     case NVME_ZONE_ACTION_ZRWA_FLUSH:
-        op = BLK_ZO_INVALID;
-        break;
-//        if (all) {
-//            return NVME_INVALID_FIELD | NVME_DNR;
-//        }
-//
-//        return nvme_zone_mgmt_send_zrwa_flush(n, zone, slba, req);
+        if (all) {
+            return NVME_INVALID_FIELD | NVME_DNR;
+        }
+
+        return nvme_zone_mgmt_send_zrwa_flush(n, zone_idx, slba, req);
 
     default:
         op = BLK_ZO_INVALID;
