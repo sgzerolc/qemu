@@ -3331,6 +3331,39 @@ enum NvmeZoneProcessingMask {
     NVME_PROC_FULL_ZONES      = 1 << 3,
 };
 
+static uint16_t nvme_zone_mgmt_send_zrwa_flush(NvmeCtrl *n, uint32_t zidx,
+                                               uint64_t elba, NvmeRequest *req)
+{
+    NvmeNamespace *ns = req->ns;
+    uint16_t ozcs = le16_to_cpu(ns->id_ns_zoned->ozcs);
+    BlockZoneWps *wps = blk_get_zone_wps(ns->blkconf.blk);
+    uint64_t *wp = &wps->wp[zidx];
+    uint64_t raw_wpv = BDRV_ZP_GET_WP(*wp);
+    uint8_t za = BDRV_ZP_GET_ZA(raw_wpv);
+    uint64_t wpv = BDRV_ZP_GET_WP(raw_wpv);
+    uint32_t nlb = elba - wpv + 1;
+
+    if (!(ozcs & NVME_ID_NS_ZONED_OZCS_ZRWASUP)) {
+        return NVME_INVALID_ZONE_OP | NVME_DNR;
+    }
+
+    if (!(za & NVME_ZA_ZRWA_VALID)) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+
+    if (elba < wpv || elba > wpv + ns->zns.zrwas) {
+        return NVME_ZONE_BOUNDARY_ERROR | NVME_DNR;
+    }
+
+    if (nlb % ns->zns.zrwafg) {
+        return NVME_INVALID_FIELD | NVME_DNR;
+    }
+
+    *wp += nlb;
+
+    return NVME_SUCCESS;
+}
+
 static void nvme_zone_mgmt_send_completed_cb(void *opaque, int ret)
 {
     if (ret) {
@@ -3418,8 +3451,11 @@ static uint16_t nvme_zone_mgmt_send(NvmeCtrl *n, NvmeRequest *req)
         trace_pci_nvme_zd_extension_set(zone_idx);
         break;
     case NVME_ZONE_ACTION_ZRWA_FLUSH:
-        op = BLK_ZO_INVALID;
-        break;
+        if (all) {
+            return NVME_INVALID_FIELD | NVME_DNR;
+        }
+
+        return nvme_zone_mgmt_send_zrwa_flush(n, zone_idx, slba, req);
 
     default:
         op = BLK_ZO_INVALID;
