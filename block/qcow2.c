@@ -316,6 +316,7 @@ static bool qcow2_can_open_zone(BlockDriverState *bs)
         QLIST_REMOVE(zone_entry, imp_open_zone_entry);
         s->nr_zones_imp_open--;
         trace_qcow2_imp_open_zones(0x23, s->nr_zones_imp_open);
+        QLIST_INSERT_HEAD(&s->closed_zones, zone_entry, closed_zone_entry);
         s->nr_zones_closed++;
         return true;
     }
@@ -3054,6 +3055,16 @@ qcow2_co_pwritev_part(BlockDriverState *bs, int64_t offset, int64_t bytes,
                     if (zs == BLK_ZS_CLOSED) {
                         s->nr_zones_closed--;
                     }
+                } else if (zs == BLK_ZS_IOPEN) {
+                    /*
+                     * The LRU policy: update the zone that is most recently
+                     * used to the head of the zone list
+                     */
+                    QLIST_REMOVE(zone_entry, imp_open_zone_entry);
+                    QLIST_INSERT_HEAD(&s->imp_open_zones, zone_entry,
+                                      imp_open_zone_entry);
+                    trace_qcow2_imp_open_zones(0x24,
+                                               s->nr_zones_imp_open);
                 }
             }
         }
