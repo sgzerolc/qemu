@@ -2452,6 +2452,22 @@ BlockZoneWps *blk_get_zone_wps(BlockBackend *blk)
     return bs ? bs->wps : NULL;
 }
 
+uint8_t *blk_get_zone_extension(BlockBackend *blk)
+{
+    BlockDriverState *bs = blk_bs(blk);
+    IO_CODE();
+
+    return bs ? bs->zd_extensions : NULL;
+}
+
+uint32_t blk_get_zd_ext_size(BlockBackend *blk)
+{
+    BlockDriverState *bs = blk_bs(blk);
+    IO_CODE();
+
+    return bs ? bs->bl.zd_extension_size : 0;
+}
+
 void *blk_try_blockalign(BlockBackend *blk, size_t size)
 {
     IO_CODE();
