@@ -64,6 +64,7 @@
 #define BLOCK_OPT_MAX_APPEND_BYTES      "zone.max_append_bytes"
 #define BLOCK_OPT_MAX_ACTIVE_ZONES      "zone.max_active_zones"
 #define BLOCK_OPT_MAX_OPEN_ZONES        "zone.max_open_zones"
+#define BLOCK_OPT_ZD_EXT_SIZE        "zd_extension_size"
 
 #define BLOCK_PROBE_BUF_SIZE        512
 
@@ -912,6 +913,9 @@ typedef struct BlockLimits {
     uint32_t max_active_zones;
 
     uint32_t write_granularity;
+
+    /* size of data that is associated with a zone in bytes */
+    uint32_t zd_extension_size;
 } BlockLimits;
 
 typedef struct BdrvOpBlocker BdrvOpBlocker;
@@ -1270,6 +1274,8 @@ struct BlockDriverState {
 
     /* array of write pointers' location of each zone in the zoned device. */
     BlockZoneWps *wps;
+
+    uint8_t *zd_extensions;
 };
 
 struct BlockBackendRootState {

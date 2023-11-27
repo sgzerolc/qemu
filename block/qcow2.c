@@ -354,7 +354,8 @@ static inline int qcow2_refresh_zonedmeta(BlockDriverState *bs)
 {
     int ret;
     BDRVQcow2State *s = bs->opaque;
-    uint64_t wps_size = s->zoned_header.zonedmeta_size;
+    uint64_t wps_size = s->zoned_header.zonedmeta_size -
+        s->zded_size;
     g_autofree uint64_t *temp = NULL;
     temp = g_new(uint64_t, wps_size);
     ret = bdrv_pread(bs->file, s->zoned_header.zonedmeta_offset,
@@ -364,7 +365,17 @@ static inline int qcow2_refresh_zonedmeta(BlockDriverState *bs)
         return ret;
     }
 
+    g_autofree uint8_t *zded = NULL;
+    zded = g_try_malloc0(s->zded_size);
+    ret = bdrv_pread(bs->file, s->zoned_header.zonedmeta_offset + wps_size,
+                     s->zded_size, zded, 0);
+    if (ret < 0) {
+        error_report("Can not read zded");
+        return ret;
+    }
+
     memcpy(bs->wps->wp, temp, wps_size);
+    memcpy(bs->zd_extensions, zded, s->zded_size);
     return 0;
 }
 
@@ -388,6 +399,19 @@ qcow2_check_zone_options(Qcow2ZonedHeaderExtension *zone_opt)
                          "%" PRIu32"B", zone_opt->zone_capacity,
                          zone_opt->zone_size);
             return false;
+        }
+
+        if (zone_opt->zd_extension_size) {
+            if (zone_opt->zd_extension_size & 0x3f) {
+                error_report("zone descriptor extension size must be a "
+                             "multiple of 64B");
+                return false;
+            }
+
+            if ((zone_opt->zd_extension_size >> 6) > 0xff) {
+                error_report("Zone descriptor extension size is too large");
+                return false;
+            }
         }
 
         if (zone_opt->max_active_zones > zone_opt->nr_zones) {
@@ -676,6 +700,8 @@ qcow2_read_extensions(BlockDriverState *bs, uint64_t start_offset,
             zoned_ext.conventional_zones =
                 be32_to_cpu(zoned_ext.conventional_zones);
             zoned_ext.nr_zones = be32_to_cpu(zoned_ext.nr_zones);
+            zoned_ext.zd_extension_size =
+                be32_to_cpu(zoned_ext.zd_extension_size);
             zoned_ext.max_open_zones = be32_to_cpu(zoned_ext.max_open_zones);
             zoned_ext.max_active_zones =
                 be32_to_cpu(zoned_ext.max_active_zones);
@@ -686,7 +712,8 @@ qcow2_read_extensions(BlockDriverState *bs, uint64_t start_offset,
             zoned_ext.zonedmeta_size = be64_to_cpu(zoned_ext.zonedmeta_size);
             s->zoned_header = zoned_ext;
             bs->wps = g_malloc(sizeof(BlockZoneWps)
-                + s->zoned_header.zonedmeta_size);
+                + zoned_ext.zonedmeta_size - s->zded_size);
+            bs->zd_extensions = g_malloc0(s->zded_size);
             ret = qcow2_refresh_zonedmeta(bs);
             if (ret < 0) {
                 error_setg_errno(errp, -ret, "zonedmeta: "
@@ -2264,6 +2291,7 @@ static void qcow2_refresh_limits(BlockDriverState *bs, Error **errp)
     bs->bl.zone_size = s->zoned_header.zone_size;
     bs->bl.zone_capacity = s->zoned_header.zone_capacity;
     bs->bl.write_granularity = BDRV_SECTOR_SIZE;
+    bs->bl.zd_extension_size = s->zoned_header.zd_extension_size;
 }
 
 static int GRAPH_UNLOCKED
@@ -3534,6 +3562,8 @@ int qcow2_update_header(BlockDriverState *bs)
             .conventional_zones =
                 cpu_to_be32(s->zoned_header.conventional_zones),
             .nr_zones           = cpu_to_be32(s->zoned_header.nr_zones),
+            .zd_extension_size  =
+                cpu_to_be32(s->zoned_header.zd_extension_size),
             .max_open_zones     = cpu_to_be32(s->zoned_header.max_open_zones),
             .max_active_zones   =
                 cpu_to_be32(s->zoned_header.max_active_zones),
@@ -4287,6 +4317,15 @@ qcow2_co_create(BlockdevCreateOptions *create_options, Error **errp)
         }
         s->zoned_header.max_append_bytes = zone_host_managed->max_append_bytes;
 
+        uint64_t zded_size = 0;
+        if (zone_host_managed->has_descriptor_extension_size) {
+            s->zoned_header.zd_extension_size =
+                zone_host_managed->descriptor_extension_size;
+            zded_size = s->zoned_header.zd_extension_size *
+                bs->bl.nr_zones;
+        }
+        s->zded_size = zded_size;
+
         if (!qcow2_check_zone_options(&s->zoned_header)) {
             s->zoned_header.zoned = BLK_Z_NONE;
             ret = -EINVAL;
@@ -4294,7 +4333,7 @@ qcow2_co_create(BlockdevCreateOptions *create_options, Error **errp)
         }
 
         uint32_t nrz = s->zoned_header.nr_zones;
-        zoned_meta_size =  sizeof(uint64_t) * nrz;
+        zoned_meta_size =  sizeof(uint64_t) * nrz + zded_size;
         g_autofree uint64_t *meta = NULL;
         meta = g_new0(uint64_t, nrz);
 
@@ -4326,10 +4365,23 @@ qcow2_co_create(BlockdevCreateOptions *create_options, Error **errp)
             error_setg_errno(errp, -ret, "Could not zero fill zoned metadata");
             goto out;
         }
-        ret = bdrv_pwrite(blk_bs(blk)->file, offset, zoned_meta_size, meta, 0);
+
+        ret = bdrv_pwrite(blk_bs(blk)->file, offset,
+                          zoned_meta_size - zded_size, meta, 0);
         if (ret < 0) {
             error_setg_errno(errp, -ret, "Could not write zoned metadata "
                                          "to disk");
+        }
+
+        if (zone_host_managed->has_descriptor_extension_size) {
+            /* Initialize zone descriptor extensions */
+            ret = bdrv_co_pwrite_zeroes(blk_bs(blk)->file, offset + zded_size,
+                                        zded_size, 0);
+            if (ret < 0) {
+                error_setg_errno(errp, -ret, "Could not write zone descriptor"
+                                             "extensions to disk");
+                goto out;
+            }
         }
     } else {
         s->zoned_header.zoned = BLK_Z_NONE;
@@ -4472,6 +4524,7 @@ qcow2_co_create_opts(BlockDriver *drv, const char *filename, QemuOpts *opts,
         { BLOCK_OPT_MAX_OPEN_ZONES,     "zone.max-open-zones" },
         { BLOCK_OPT_MAX_ACTIVE_ZONES,   "zone.max-active-zones" },
         { BLOCK_OPT_MAX_APPEND_BYTES,   "zone.max-append-bytes" },
+        { BLOCK_OPT_ZD_EXT_SIZE,        "zone.descriptor-extension-size" },
         { NULL, NULL },
     };
 
@@ -7061,7 +7114,13 @@ static QemuOptsList qcow2_create_opts = {
             .name = BLOCK_OPT_MAX_OPEN_ZONES,                           \
             .type = QEMU_OPT_NUMBER,                                    \
             .help = "max open zones",                                   \
-        },
+        },                                                              \
+            {                                                           \
+            .name = BLOCK_OPT_ZD_EXT_SIZE,                              \
+            .type = QEMU_OPT_SIZE,                                      \
+            .help = "zone descriptor extension size (defaults "         \
+                    "to 0, must be a multiple of 64 bytes)",            \
+        },                                                              \
         QCOW_COMMON_OPTIONS,
         { /* end of list */ }
     }

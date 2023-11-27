@@ -5074,12 +5074,16 @@
 #     append request that can be issued to the device.  It must be
 #     512-byte aligned
 #
+# @descriptor-extension-size: The size of zone descriptor extension
+#     data. Must be a multiple of 64 bytes (since 8.2)
+#
 # Since 8.2
 ##
 { 'struct': 'Qcow2ZoneHostManaged',
   'data': { '*size':          'size',
             '*capacity':      'size',
             '*conventional-zones': 'uint32',
+            '*descriptor-extension-size':  'size',
             '*max-open-zones':     'uint32',
             '*max-active-zones':   'uint32',
             '*max-append-bytes':   'uint32' } }
