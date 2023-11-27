@@ -108,6 +108,8 @@ uint32_t blk_get_max_append_sectors(BlockBackend *blk);
 uint32_t blk_get_nr_zones(BlockBackend *blk);
 uint32_t blk_get_write_granularity(BlockBackend *blk);
 BlockZoneWps *blk_get_zone_wps(BlockBackend *blk);
+uint8_t *blk_get_zone_extension(BlockBackend *blk);
+uint32_t blk_get_zd_ext_size(BlockBackend *blk);
 
 AioContext *blk_get_aio_context(BlockBackend *blk);
 BlockAcctStats *blk_get_stats(BlockBackend *blk);
