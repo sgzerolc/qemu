@@ -230,50 +230,69 @@ static inline BlockZoneState qcow2_get_zone_state(BlockDriverState *bs,
         return BLK_ZS_FULL;
     }
     if (zone_wp > zone_start) {
+        if (!QLIST_IS_INSERTED(zone_entry, closed_zone_entry)) {
+            /*
+             * The number of closed zones is not always updated in time when
+             * the device is closed. However, it only matters when doing
+             * zone report. Refresh the count and list of closed zones to
+             * provide correct zone states for zone report.
+             */
+            QLIST_INSERT_HEAD(&s->closed_zones, zone_entry, closed_zone_entry);
+            s->nr_zones_closed++;
+        }
         return BLK_ZS_CLOSED;
     }
     return BLK_ZS_NOT_WP;
 }
 
-static void qcow2_rm_exp_open_zone(BlockDriverState *bs,
+static void qcow2_rm_exp_open_zone(BDRVQcow2State *s,
                                    uint32_t index)
 {
-    BDRVQcow2State *s = bs->opaque;
     Qcow2ZoneListEntry *zone_entry = &s->zone_list_entries[index];
 
     QLIST_REMOVE(zone_entry, exp_open_zone_entry);
     s->nr_zones_exp_open--;
+    printf("rm_exp_open': closed zone: %d; exp zone:%d; imp zone: %d\n", s->nr_zones_closed, s->nr_zones_exp_open, s->nr_zones_imp_open);
 }
 
-static void qcow2_rm_imp_open_zone(BlockDriverState *bs,
+static void qcow2_rm_imp_open_zone(BDRVQcow2State *s,
                                    uint32_t index)
 {
-    BDRVQcow2State *s = bs->opaque;
     Qcow2ZoneListEntry *zone_entry = &s->zone_list_entries[index];
 
     QLIST_REMOVE(zone_entry, imp_open_zone_entry);
     s->nr_zones_imp_open--;
+    printf("rm_imp_open': closed zone: %d; exp zone:%d; imp zone: %d\n", s->nr_zones_closed, s->nr_zones_exp_open, s->nr_zones_imp_open);
 }
 
-static void qcow2_rm_open_zone(BlockDriverState *bs,
+static void qcow2_rm_open_zone(BDRVQcow2State *s,
                                uint32_t index)
 {
-    BDRVQcow2State *s = bs->opaque;
     Qcow2ZoneListEntry *zone_entry = &s->zone_list_entries[index];
 
     if (QLIST_IS_INSERTED(zone_entry, exp_open_zone_entry)) {
-        qcow2_rm_exp_open_zone(bs, index);
+        qcow2_rm_exp_open_zone(s, index);
     } else if (QLIST_IS_INSERTED(zone_entry, imp_open_zone_entry)) {
-        qcow2_rm_imp_open_zone(bs, index);
+        qcow2_rm_imp_open_zone(s, index);
     }
 }
 
-static void qcow2_do_imp_open_zone(BlockDriverState *bs,
+static void qcow2_rm_closed_zone(BDRVQcow2State *s,
+                                 uint32_t index)
+{
+    Qcow2ZoneListEntry *zone_entry = &s->zone_list_entries[index];
+
+    QLIST_REMOVE(zone_entry, closed_zone_entry);
+    s->nr_zones_closed--;
+    printf("rm_closed': closed zone: %d; exp zone:%d; imp zone: %d\n", s->nr_zones_closed, s->nr_zones_exp_open, s->nr_zones_imp_open);
+}
+
+static void qcow2_do_imp_open_zone(BDRVQcow2State *s,
                                    uint32_t index,
                                    BlockZoneState zs)
 {
-    BDRVQcow2State *s = bs->opaque;
     Qcow2ZoneListEntry *zone_entry = &s->zone_list_entries[index];
+    printf("do_imp_open: closed zone: %d; exp zone:%d; imp zone: %d\n", s->nr_zones_closed, s->nr_zones_exp_open, s->nr_zones_imp_open);
 
     switch (zs) {
     case BLK_ZS_EMPTY:
@@ -298,16 +317,17 @@ static void qcow2_do_imp_open_zone(BlockDriverState *bs,
 
     QLIST_INSERT_HEAD(&s->imp_open_zones, zone_entry, imp_open_zone_entry);
     s->nr_zones_imp_open++;
+    printf("do_imp_open': closed zone: %d; exp zone:%d; imp zone: %d\n", s->nr_zones_closed, s->nr_zones_exp_open, s->nr_zones_imp_open);
 }
 
-static void qcow2_do_exp_open_zone(BlockDriverState *bs,
+static void qcow2_do_exp_open_zone(BDRVQcow2State *s,
                                    uint32_t index)
 {
-    BDRVQcow2State *s = bs->opaque;
     Qcow2ZoneListEntry *zone_entry = &s->zone_list_entries[index];
 
     QLIST_INSERT_HEAD(&s->exp_open_zones, zone_entry, exp_open_zone_entry);
     s->nr_zones_exp_open++;
+    printf("do_exp_open': closed zone: %d; exp zone:%d; imp zone: %d\n", s->nr_zones_closed, s->nr_zones_exp_open, s->nr_zones_imp_open);
 }
 
 /*
@@ -324,6 +344,7 @@ static void qcow2_do_close_zone(BlockDriverState *bs,
 {
     BDRVQcow2State *s = bs->opaque;
     Qcow2ZoneListEntry *zone_entry;
+    BlockZoneState new_zone_state;
 
     if ((zs == BLK_ZS_IOPEN) && (index < 0)) {
         /* Only implicitly open zone is closed without specifying index */
@@ -333,14 +354,21 @@ static void qcow2_do_close_zone(BlockDriverState *bs,
     }
 
     if (zs == BLK_ZS_IOPEN) {
-        qcow2_rm_imp_open_zone(bs, index);
+        qcow2_rm_imp_open_zone(s, index);
     }
     if (zs == BLK_ZS_EOPEN) {
-        qcow2_rm_exp_open_zone(bs, index);
+        qcow2_rm_exp_open_zone(s, index);
     }
 
-    QLIST_INSERT_HEAD(&s->closed_zones, zone_entry, closed_zone_entry);
-    s->nr_zones_closed++;
+    /*
+     * The zone state changes when the zone is removed from the list of
+     * open zones (Explicitly open -> empty)
+     */
+    new_zone_state = qcow2_get_zone_state(bs, index);
+    if (new_zone_state != BLK_ZS_EMPTY && new_zone_state != BLK_ZS_CLOSED) {
+        QLIST_INSERT_HEAD(&s->closed_zones, zone_entry, closed_zone_entry);
+        s->nr_zones_closed++;
+    }
 }
 
 /*
@@ -3085,11 +3113,11 @@ qcow2_co_pwritev_part(BlockDriverState *bs, int64_t offset, int64_t bytes,
             zs = qcow2_get_zone_state(bs, index);
             if (!(end_offset & (zone_capacity - 1))) {
                 /* Being aligned to zone capacity implies full state */
-                qcow2_rm_open_zone(bs, index);
+                qcow2_rm_open_zone(s, index);
                 trace_qcow2_imp_open_zones(0x24,
                                            s->nr_zones_imp_open);
             } else {
-                qcow2_do_imp_open_zone(bs, index, zs);
+                qcow2_do_imp_open_zone(s, index, zs);
                 trace_qcow2_imp_open_zones(0x24,
                                            s->nr_zones_imp_open);
             }
@@ -3220,7 +3248,6 @@ static void qcow2_do_close_all_zone(BDRVQcow2State *s)
                        next) {
         QLIST_REMOVE(zone_entry, imp_open_zone_entry);
         s->nr_zones_imp_open--;
-        trace_qcow2_imp_open_zones(0x22, s->nr_zones_imp_open);
     }
 
     QLIST_FOREACH_SAFE(zone_entry, &s->exp_open_zones, exp_open_zone_entry,
@@ -3228,6 +3255,7 @@ static void qcow2_do_close_all_zone(BDRVQcow2State *s)
         QLIST_REMOVE(zone_entry, exp_open_zone_entry);
         s->nr_zones_exp_open--;
     }
+    printf("close all zone: closed zone: %d; exp zone:%d; imp zone: %d\n", s->nr_zones_closed, s->nr_zones_exp_open, s->nr_zones_imp_open);
 
     assert(s->nr_zones_imp_open + s->nr_zones_exp_open == 0);
 }
@@ -4774,6 +4802,7 @@ qcow2_co_zone_report(BlockDriverState *bs, int64_t offset,
         zones[i].wp = wp;
     }
     qemu_co_mutex_unlock(&bs->wps->colock);
+    printf("zrp': closed zone: %d; exp zone:%d; imp zone: %d\n", s->nr_zones_closed, s->nr_zones_exp_open, s->nr_zones_imp_open);
     *nr_zones = i;
     return 0;
 }
@@ -4786,6 +4815,8 @@ qcow2_open_zone(BlockDriverState *bs, uint32_t index) {
     qemu_co_mutex_lock(&bs->wps->colock);
     uint64_t *wp = &bs->wps->wp[index];
     BlockZoneState zs = qcow2_get_zone_state(bs, index);
+    printf("zo: closed zone: %d; exp zone:%d; imp zone: %d\n", s->nr_zones_closed, s->nr_zones_exp_open, s->nr_zones_imp_open);
+    trace_qcow2_imp_open_zones(BLK_ZO_OPEN, s->nr_zones_imp_open);
 
     switch(zs) {
     case BLK_ZS_EMPTY:
@@ -4795,8 +4826,7 @@ qcow2_open_zone(BlockDriverState *bs, uint32_t index) {
         }
         break;
     case BLK_ZS_IOPEN:
-        qcow2_rm_imp_open_zone(bs, index);
-        trace_qcow2_imp_open_zones(BLK_ZO_OPEN, s->nr_zones_imp_open);
+        qcow2_rm_imp_open_zone(s, index);
         break;
     case BLK_ZS_EOPEN:
         return 0;
@@ -4816,8 +4846,9 @@ qcow2_open_zone(BlockDriverState *bs, uint32_t index) {
 
     ret = qcow2_write_wp_at(bs, wp, index);
     if (!ret) {
-        qcow2_do_exp_open_zone(bs, index);
+        qcow2_do_exp_open_zone(s, index);
     }
+    printf("zo': closed zone: %d; exp zone:%d; imp zone: %d\n", s->nr_zones_closed, s->nr_zones_exp_open, s->nr_zones_imp_open);
 
 unlock:
     qemu_co_mutex_unlock(&bs->wps->colock);
@@ -4826,9 +4857,11 @@ unlock:
 
 static int qcow2_close_zone(BlockDriverState *bs, uint32_t index) {
     int ret;
+    BDRVQcow2State *s = bs->opaque;
 
     qemu_co_mutex_lock(&bs->wps->colock);
     BlockZoneState zs = qcow2_get_zone_state(bs, index);
+    printf("zc: closed zone: %d; exp zone:%d; imp zone: %d\n", s->nr_zones_closed, s->nr_zones_exp_open, s->nr_zones_imp_open);
 
     switch(zs) {
     case BLK_ZS_EMPTY:
@@ -4848,6 +4881,8 @@ static int qcow2_close_zone(BlockDriverState *bs, uint32_t index) {
         goto unlock;
     }
     qcow2_do_close_zone(bs, index, zs);
+    printf("zc': closed zone: %d; exp zone:%d; imp zone: %d\n", s->nr_zones_closed, s->nr_zones_exp_open, s->nr_zones_imp_open);
+
     ret = 0;
 
 unlock:
@@ -4863,7 +4898,7 @@ qcow2_finish_zone(BlockDriverState *bs, uint32_t index) {
     qemu_co_mutex_lock(&bs->wps->colock);
     uint64_t *wp = &bs->wps->wp[index];
     BlockZoneState zs = qcow2_get_zone_state(bs, index);
-
+    printf("zf: closed zone: %d; exp zone:%d; imp zone: %d\n", s->nr_zones_closed, s->nr_zones_exp_open, s->nr_zones_imp_open);
     switch(zs) {
     case BLK_ZS_EMPTY:
         if (!qcow2_can_activate_zone(bs)) {
@@ -4872,18 +4907,18 @@ qcow2_finish_zone(BlockDriverState *bs, uint32_t index) {
         }
         break;
     case BLK_ZS_IOPEN:
-        qcow2_rm_imp_open_zone(bs, index);
+        qcow2_rm_imp_open_zone(s, index);
         trace_qcow2_imp_open_zones(BLK_ZO_FINISH, s->nr_zones_imp_open);
         break;
     case BLK_ZS_EOPEN:
-        qcow2_rm_exp_open_zone(bs, index);
+        qcow2_rm_exp_open_zone(s, index);
         break;
     case BLK_ZS_CLOSED:
         if (!qcow2_can_open_zone(bs)) {
             ret = -EINVAL;
             goto unlock;
         }
-        s->nr_zones_closed--;
+        qcow2_rm_closed_zone(s, index);
         break;
     case BLK_ZS_FULL:
         ret = 0;
@@ -4895,6 +4930,7 @@ qcow2_finish_zone(BlockDriverState *bs, uint32_t index) {
 
     *wp = ((uint64_t)index + 1) * s->zoned_header.zone_size;
     ret = qcow2_write_wp_at(bs, wp, index);
+    printf("zf': closed zone: %d; exp zone:%d; imp zone: %d\n", s->nr_zones_closed, s->nr_zones_exp_open, s->nr_zones_imp_open);
 
 unlock:
     qemu_co_mutex_unlock(&bs->wps->colock);
@@ -4910,6 +4946,7 @@ qcow2_reset_zone(BlockDriverState *bs, uint32_t index,
     int n, ret = 0;
 
     qemu_co_mutex_lock(&bs->wps->colock);
+    printf("zrs: closed zone: %d; exp zone:%d; imp zone: %d\n", s->nr_zones_closed, s->nr_zones_exp_open, s->nr_zones_imp_open);
     uint64_t *wp = &bs->wps->wp[index];
     if (len == bs->total_sectors << BDRV_SECTOR_BITS) {
         n = nrz;
@@ -4930,14 +4967,14 @@ qcow2_reset_zone(BlockDriverState *bs, uint32_t index,
         case BLK_ZS_EMPTY:
             break;
         case BLK_ZS_IOPEN:
-            qcow2_rm_imp_open_zone(bs, index + i);
+            qcow2_rm_imp_open_zone(s, index + i);
             trace_qcow2_imp_open_zones(BLK_ZO_RESET, s->nr_zones_imp_open);
             break;
         case BLK_ZS_EOPEN:
-            qcow2_rm_exp_open_zone(bs, index + i);
+            qcow2_rm_exp_open_zone(s, index + i);
             break;
         case BLK_ZS_CLOSED:
-            s->nr_zones_closed--;
+            qcow2_rm_closed_zone(s, index + i);
             break;
         case BLK_ZS_FULL:
             break;
@@ -4961,7 +4998,7 @@ qcow2_reset_zone(BlockDriverState *bs, uint32_t index,
             error_report("Failed to reset zone at 0x%" PRIx64 "", *wp_i);
         }
     }
-
+    printf("zrs': closed zone: %d; exp zone:%d; imp zone: %d\n", s->nr_zones_closed, s->nr_zones_exp_open, s->nr_zones_imp_open);
 unlock:
     qemu_co_mutex_unlock(&bs->wps->colock);
     return ret;
